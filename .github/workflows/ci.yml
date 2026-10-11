@@ -30,7 +30,7 @@ jobs:
           dotnet publish src/LocalhostDock/LocalhostDock.csproj -c Release -r win-x64
           --self-contained false -p:PublishSingleFile=true -o publish
 
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v6
         with:
           name: LocalhostDock-win-x64
           path: publish/
@@ -42,7 +42,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v6
         with:
           name: LocalhostDock-win-x64
           path: LocalhostDock
