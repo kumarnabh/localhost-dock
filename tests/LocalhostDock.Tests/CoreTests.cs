@@ -121,7 +121,7 @@ public class CoreTests
     }
 
     [Fact]
-    public void Discovery_lists_unregistered_dev_ports_but_not_registered_or_ignored()
+    public async Task Discovery_lists_unregistered_dev_ports_but_not_registered_or_ignored()
     {
         int port = FreePortBelowEphemeral();
         using var server = Process.Start(new ProcessStartInfo("node",
@@ -129,7 +129,7 @@ public class CoreTests
         { CreateNoWindow = true, UseShellExecute = false })!;
         try
         {
-            Assert.True(Until(() => PortTable.GetListeners().Any(l => l.Port == port), 15).Result, "node never listened");
+            Assert.True(await Until(() => PortTable.GetListeners().Any(l => l.Port == port), 15), "node never listened");
             var reg = new Registry();
             var controller = new AppController(reg);
             var found = controller.Poll().Discovered.SingleOrDefault(d => d.Port == port);
