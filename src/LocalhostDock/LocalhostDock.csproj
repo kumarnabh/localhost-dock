@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>LocalhostDock</AssemblyName>
+    <RootNamespace>LocalhostDock</RootNamespace>
+    <Version>0.1.0</Version>
+    <Product>Localhost Dock</Product>
+    <Description>A tray widget for every local app and dev server you run.</Description>
+    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.Management" Version="8.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="..\..\apps.example.json" Link="apps.example.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>

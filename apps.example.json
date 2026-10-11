@@ -1,0 +1,30 @@
+{
+  // Localhost Dock registry. Copied to %APPDATA%\LocalhostDock\apps.json on first run.
+  // Comments and trailing commas are allowed. See docs/CONFIGURATION.md for every field.
+  "apps": [
+    {
+      // Reuse an existing launcher: point "start" (and optionally "stop") at your .cmd files.
+      "name": "My API",
+      "port": 8765,
+      "start": "C:\\dev\\my-api\\Start-API.cmd",
+      "stop": "C:\\dev\\my-api\\Stop-API.cmd"
+    },
+    {
+      // Or any command line, run in "cwd".
+      "name": "Web (Vite)",
+      "port": 5173,
+      "start": "npm run dev",
+      "cwd": "C:\\dev\\my-web"
+    },
+    {
+      // An app that uses two ports: the dot follows "port", Stop frees both.
+      "name": "Full stack",
+      "port": 3000,
+      "extraPorts": [8000],
+      "url": "http://localhost:3000/dashboard",
+      "start": "C:\\dev\\fullstack\\start.bat"
+    }
+  ],
+  "ignoredPorts": [],
+  "pollMs": 2000
+}

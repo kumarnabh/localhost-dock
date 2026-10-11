@@ -1,0 +1,13 @@
+bin/
+obj/
+publish/
+artifacts/
+*.user
+*.suo
+.vs/
+.vscode/
+.idea/
+TestResults/
+
+# Never commit a personal registry.
+apps.json
