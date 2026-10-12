@@ -68,7 +68,7 @@ public class CoreTests
     public void Registry_round_trips_and_seeds_from_example()
     {
         string dir = Path.Combine(Path.GetTempPath(), "ldock-test-" + Guid.NewGuid().ToString("N"));
-        Environment.SetEnvironmentVariable("LOCALHOST_DOCK_HOME", dir);
+        using var sandbox = TestSandbox.Use(dir);
         try
         {
             var reg = Registry.Load(); // seeded from apps.example.json (copied to the output folder)
@@ -86,7 +86,6 @@ public class CoreTests
         }
         finally
         {
-            Environment.SetEnvironmentVariable("LOCALHOST_DOCK_HOME", null);
             Directory.Delete(dir, true);
         }
     }

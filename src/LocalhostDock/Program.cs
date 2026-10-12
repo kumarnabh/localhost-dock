@@ -1,22 +1,29 @@
+using LocalhostDock.Integration;
 using LocalhostDock.UI;
 
 namespace LocalhostDock;
 
 internal static class Program
 {
+    /// <summary>
+    /// LocalhostDock.exe [--show] [--add &lt;launcher-or-folder&gt;]
+    /// If the dock is already running, the arguments are handed to it (so --add opens its Add dialog).
+    /// </summary>
     [STAThread]
     private static void Main(string[] args)
     {
-        bool show = args.Contains("--show", StringComparer.OrdinalIgnoreCase);
-        using var mutex = new Mutex(true, @"Local\LocalhostDock.SingleInstance", out bool isFirst);
-        if (!isFirst)
+        using var instance = new SingleInstance();
+        if (!instance.IsFirst)
         {
-            MessageBox.Show("Localhost Dock is already running. Look for it in the system tray.",
-                "Localhost Dock", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            if (!SingleInstance.Forward(args.Length > 0 ? args : new[] { "--show" }))
+                MessageBox.Show("Localhost Dock is already running. Look for it in the system tray.",
+                    "Localhost Dock", MessageBoxButtons.OK, MessageBoxIcon.Information);
             return;
         }
 
         ApplicationConfiguration.Initialize();
-        Application.Run(new TrayApp(showOnStart: show));
+        var app = new TrayApp(args);
+        instance.Listen(app.HandleArgs);
+        Application.Run(app);
     }
 }

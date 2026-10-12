@@ -1,6 +1,8 @@
 {
   // Localhost Dock registry. Copied to %APPDATA%\LocalhostDock\apps.json on first run.
-  // Comments and trailing commas are allowed. See docs/CONFIGURATION.md for every field.
+  // You rarely need to edit this by hand: drop a launcher or project folder on the dock, or use
+  // "+ Add → Scan a folder for apps". Comments and trailing commas are allowed.
+  // See docs/CONFIGURATION.md for every field.
   "apps": [
     {
       // Reuse an existing launcher: point "start" (and optionally "stop") at your .cmd files.
@@ -10,11 +12,12 @@
       "stop": "C:\\dev\\my-api\\Stop-API.cmd"
     },
     {
-      // Or any command line, run in "cwd".
-      "name": "Web (Vite)",
-      "port": 5173,
+      // Or any command line, run in "cwd". captureLogs records its output for "View logs".
+      "name": "Web",
+      "port": 5280,
       "start": "npm run dev",
-      "cwd": "C:\\dev\\my-web"
+      "cwd": "C:\\dev\\my-web",
+      "captureLogs": true
     },
     {
       // An app that uses two ports: the dot follows "port", Stop frees both.
@@ -25,6 +28,12 @@
       "start": "C:\\dev\\fullstack\\start.bat"
     }
   ],
+  // Start several apps with one click, in order; stopped in reverse.
+  "groups": [
+    { "name": "Everything", "apps": ["My API", "Web"] }
+  ],
   "ignoredPorts": [],
-  "pollMs": 2000
+  "pollMs": 2000,
+  "hotkey": "Ctrl+Alt+L",
+  "notifications": "all"
 }

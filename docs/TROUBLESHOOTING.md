@@ -18,9 +18,9 @@ The dot follows the app's **`port`** only. Check that the port in `apps.json` is
 
 ### Start does nothing / the dot stays amber, then goes red
 
-- Open the minimized console window the launcher started; the error is usually there. Set `"window": "normal"` while you debug.
+- Open the minimized console window the launcher started; the error is usually there. Set `"window": "normal"` while you debug, or tick **Capture output to a log** and use **⋯ → View logs** (the *didn't start* toast links straight to it).
 - Make sure `start` points at a file that exists, or is a valid command line for `cwd`.
-- Launchers with `pause` at the end won't finish when `"window": "hidden"` is set.
+- Launchers with `pause` at the end won't finish when `"window": "hidden"` or `captureLogs` is set.
 
 ### Stop says it worked but the app comes back
 
@@ -33,6 +33,22 @@ The process runs as another user or elevated (as Administrator). Localhost Dock 
 ### The command line column is empty for some processes
 
 WMI can't read the command line of elevated or other users' processes from a non-elevated app. The port and PID are still correct.
+
+### Detection picked the wrong port or name
+
+Detection reads your scripts and suggests what it finds; it can't run them. Fix the field in the Add dialog before saving (the note under *Detect from* says where each value came from), or later with **⋯ → Edit…**. If a launcher only learns its port at runtime, start the app once and use **Add** on its *Discovered* row instead: that uses the port it's actually listening on.
+
+### The shortcut (Ctrl+Alt+L) doesn't work
+
+Another app already registered it; Localhost Dock tells you with a toast at startup. Set a different one in `apps.json`, e.g. `"hotkey": "Ctrl+Alt+Shift+D"`, then tray menu → **Reload apps.json**. `""` turns it off.
+
+### I don't see "Add to Localhost Dock" in Explorer
+
+It's off by default: tray menu → *Settings* → **Explorer right-click: "Add to Localhost Dock"**. On Windows 11 it's under **Show more options** (or <kbd>Shift</kbd>+right-click). If you move the exe, toggle it off and on again so the entry points at the new location.
+
+### I'm not getting notifications
+
+Check tray menu → *Settings* (*Notify: …*) and Windows' *Settings → System → Notifications* (Localhost Dock must be allowed, and Do Not Disturb must be off). Crash toasts only fire for apps that were up and went down without you clicking Stop.
 
 ### Where is my registry?
 

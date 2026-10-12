@@ -8,7 +8,8 @@
   never touched by install or uninstall.
 
 .PARAMETER Uninstall
-  Removes the installed files, the Start Menu shortcut and the "Start with Windows" entry.
+  Removes the installed files, the Start Menu shortcut, the "Start with Windows" entry and the
+  Explorer "Add to Localhost Dock" menu entries.
 #>
 param([switch]$Uninstall)
 
@@ -23,6 +24,10 @@ if ($Uninstall) {
     if (Test-Path $target)   { Remove-Item $target -Recurse -Force }
     if (Test-Path $shortcut) { Remove-Item $shortcut -Force }
     Remove-ItemProperty -Path $runKey -Name LocalhostDock -ErrorAction SilentlyContinue
+    foreach ($key in 'Directory', 'SystemFileAssociations\.cmd', 'SystemFileAssociations\.bat', 'SystemFileAssociations\.ps1') {
+        $path = "HKCU:\Software\Classes\$key\shell\LocalhostDock.Add"
+        if (Test-Path $path) { Remove-Item $path -Recurse -Force }
+    }
     Write-Host 'Localhost Dock uninstalled. Your apps.json was left in place.'
     return
 }

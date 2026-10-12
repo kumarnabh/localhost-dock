@@ -8,10 +8,11 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>LocalhostDock</AssemblyName>
     <RootNamespace>LocalhostDock</RootNamespace>
-    <Version>0.1.0</Version>
+    <Version>0.2.0</Version>
     <Product>Localhost Dock</Product>
     <Description>A tray widget for every local app and dev server you run.</Description>
-    <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
+    <!-- SystemAware: layout is scaled once by Theme.S(); Windows scales the whole window on monitors with a different DPI. -->
+    <ApplicationHighDpiMode>SystemAware</ApplicationHighDpiMode>
     <InvariantGlobalization>true</InvariantGlobalization>
   </PropertyGroup>
 

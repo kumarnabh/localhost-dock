@@ -26,7 +26,8 @@ Only one instance runs at a time, so quit the installed copy first (tray menu â†
 - Keep it dependency-light: the app ships as one small exe on the .NET Desktop Runtime.
 - Anything that kills a process must stay behind a confirmation, except Stop on a registered app (see the README's Safety section).
 - Never write to a user's launcher scripts. Localhost Dock reuses them; it doesn't manage them.
-- Add or update tests in `tests/LocalhostDock.Tests` for changes to `Core/`, `Net/` or `Config/`.
+- Add or update tests in `tests/LocalhostDock.Tests` for changes to `Core/`, `Net/` or `Config/`. Tests that need their own registry folder must use `TestSandbox.Use(dir)`: the test run is sandboxed so it can never touch a real `%APPDATA%\LocalhostDock`.
+- Detection improvements are very welcome: add a test with a small folder layout that reproduces the launcher or project shape.
 - Update `CHANGELOG.md` under an *Unreleased* heading and the relevant doc in `docs/`.
 
 ## Releasing

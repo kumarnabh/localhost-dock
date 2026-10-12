@@ -29,16 +29,53 @@ public sealed class AppEntry
     /// <summary>Window style for the launched console: "minimized" (default), "normal" or "hidden".</summary>
     public string Window { get; set; } = "minimized";
 
+    /// <summary>Redirect the start command's output to a log file Localhost Dock can tail (runs hidden).</summary>
+    public bool CaptureLogs { get; set; }
+
+    /// <summary>A log file your app already writes, shown by View logs.</summary>
+    public string? LogFile { get; set; }
+
     [JsonIgnore]
     public IEnumerable<int> AllPorts => (Port is int p ? new[] { p } : Array.Empty<int>()).Concat(ExtraPorts).Distinct();
 
     [JsonIgnore]
     public string? EffectiveUrl => !string.IsNullOrWhiteSpace(Url) ? Url : Port is int p ? $"http://localhost:{p}" : null;
+
+    /// <summary>The folder the app lives in: cwd, or the launcher's folder.</summary>
+    [JsonIgnore]
+    public string? Folder
+    {
+        get
+        {
+            if (!string.IsNullOrWhiteSpace(Cwd) && Directory.Exists(Cwd)) return Cwd;
+            string? start = Start?.Trim().Trim('"');
+            return start is not null && File.Exists(start) ? Path.GetDirectoryName(start) : null;
+        }
+    }
+
+    [JsonIgnore]
+    public string? EffectiveLogFile =>
+        !string.IsNullOrWhiteSpace(LogFile) ? LogFile : CaptureLogs ? Registry.CapturedLogPath(Name) : null;
+
+    public AppEntry Clone() => new()
+    {
+        Name = Name, Port = Port, ExtraPorts = ExtraPorts.ToList(), Url = Url, Start = Start, Stop = Stop,
+        Cwd = Cwd, Window = Window, CaptureLogs = CaptureLogs, LogFile = LogFile,
+    };
+}
+
+/// <summary>A named set of apps started and stopped together.</summary>
+public sealed class GroupEntry
+{
+    public string Name { get; set; } = "";
+    public List<string> Apps { get; set; } = new();
 }
 
 public sealed class Registry
 {
     public List<AppEntry> Apps { get; set; } = new();
+
+    public List<GroupEntry> Groups { get; set; } = new();
 
     /// <summary>Ports the "discovered" list should never offer (you clicked Ignore).</summary>
     public List<int> IgnoredPorts { get; set; } = new();
@@ -46,11 +83,47 @@ public sealed class Registry
     /// <summary>Status poll interval in milliseconds.</summary>
     public int PollMs { get; set; } = 2000;
 
+    /// <summary>Global shortcut that opens the dock, e.g. "Ctrl+Alt+L". Empty to disable.</summary>
+    public string Hotkey { get; set; } = "Ctrl+Alt+L";
+
+    /// <summary>Tray notifications: "all" (crashes + started), "crashes", or "off".</summary>
+    public string Notifications { get; set; } = "all";
+
+    /// <summary>Folders remembered from "Scan folder for apps".</summary>
+    public List<string> ScanFolders { get; set; } = new();
+
+    public AppEntry? Find(string name) =>
+        Apps.FirstOrDefault(a => a.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>Returns a name not yet used by any app ("Web", "Web 2", …).</summary>
+    public string UniqueName(string name, AppEntry? except = null)
+    {
+        name = string.IsNullOrWhiteSpace(name) ? "App" : name.Trim();
+        string candidate = name;
+        for (int i = 2; Apps.Any(a => a != except && a.Name.Equals(candidate, StringComparison.OrdinalIgnoreCase)); i++)
+            candidate = $"{name} {i}";
+        return candidate;
+    }
+
+    /// <summary>Renames an app and keeps group memberships pointing at it.</summary>
+    public void Rename(string oldName, string newName)
+    {
+        foreach (var g in Groups)
+            for (int i = 0; i < g.Apps.Count; i++)
+                if (g.Apps[i].Equals(oldName, StringComparison.OrdinalIgnoreCase)) g.Apps[i] = newName;
+    }
+
+    public void Remove(AppEntry app)
+    {
+        Apps.Remove(app);
+        foreach (var g in Groups) g.Apps.RemoveAll(n => n.Equals(app.Name, StringComparison.OrdinalIgnoreCase));
+    }
+
     private static readonly JsonSerializerOptions Json = new()
     {
         WriteIndented = true,
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingDefault,
         ReadCommentHandling = JsonCommentHandling.Skip,
         AllowTrailingCommas = true,
     };
@@ -61,6 +134,14 @@ public sealed class Registry
             : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "LocalhostDock");
 
     public static string FilePath => Path.Combine(Folder, "apps.json");
+
+    public static string LogsFolder => Path.Combine(Folder, "logs");
+
+    public static string CapturedLogPath(string appName)
+    {
+        string safe = string.Concat(appName.Select(c => Path.GetInvalidFileNameChars().Contains(c) ? '_' : c));
+        return Path.Combine(LogsFolder, safe + ".log");
+    }
 
     /// <summary>Loads the registry, creating it from apps.example.json on first run.</summary>
     public static Registry Load()
@@ -75,6 +156,7 @@ public sealed class Registry
 
         var reg = JsonSerializer.Deserialize<Registry>(File.ReadAllText(FilePath), Json) ?? new Registry();
         reg.Apps.RemoveAll(a => string.IsNullOrWhiteSpace(a.Name));
+        reg.Groups.RemoveAll(g => string.IsNullOrWhiteSpace(g.Name));
         if (reg.PollMs < 500) reg.PollMs = 500;
         return reg;
     }
