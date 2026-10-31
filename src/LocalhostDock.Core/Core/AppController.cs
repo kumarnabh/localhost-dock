@@ -1,7 +1,9 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using LocalhostDock.Config;
+using LocalhostDock.Health;
 using LocalhostDock.Net;
+using LocalhostDock.Workspace;
 using Microsoft.Win32.SafeHandles;
 
 namespace LocalhostDock.Core;
@@ -15,6 +17,8 @@ public enum AppState
     NotConfigured,
     /// <summary>The app's port is held by a process that doesn't belong to this app.</summary>
     Conflict,
+    /// <summary>Listening, but its HTTP health check is failing.</summary>
+    Degraded,
 }
 
 /// <summary>How sure we are that a listening process belongs to an app.</summary>
@@ -37,7 +41,7 @@ public sealed record ExitInfo(int? Code, DateTime AtUtc, bool Expected, string P
 
 public sealed record AppStatus(
     AppEntry App, AppState State, IReadOnlyList<OwnedListener> Listeners, DateTime? UpSince, long MemoryBytes,
-    ExitInfo? LastExit, string? LastError)
+    ExitInfo? LastExit, string? LastError, HealthSnapshot? Health = null, TimeSpan? LastStartDuration = null)
 {
     /// <summary>Ownership of the process on the primary port (Unverified if several disagree).</summary>
     public Ownership? PrimaryOwnership =>
@@ -46,7 +50,7 @@ public sealed record AppStatus(
     public OwnedListener? ForeignHolder => Listeners.FirstOrDefault(l => l.Listener.Port == App.Port && l.Ownership == Ownership.Foreign);
 }
 
-public sealed record GroupStatus(GroupEntry Group, IReadOnlyList<AppStatus> Members)
+public sealed record WorkspaceStatus(WorkspaceEntry Workspace, IReadOnlyList<AppStatus> Members)
 {
     public int Up => Members.Count(m => m.State == AppState.Up);
     public bool Busy => Members.Any(m => m.State is AppState.Starting or AppState.Stopping);
@@ -58,11 +62,14 @@ public sealed record DiscoveredPort(int Port, int Pid, string ProcessName, strin
     public ProcessIdentity? Identity { get; init; }
 }
 
-public sealed record Snapshot(IReadOnlyList<AppStatus> Apps, IReadOnlyList<GroupStatus> Groups,
+public sealed record Snapshot(IReadOnlyList<AppStatus> Apps, IReadOnlyList<WorkspaceStatus> Workspaces,
     IReadOnlyList<DiscoveredPort> Discovered, IReadOnlyList<Listener> AllListeners);
 
 public sealed record OperationResult(bool Ok, string Message)
 {
+    /// <summary>How long a start took to become ready (StartAndWait / workspaces).</summary>
+    public TimeSpan? Duration { get; init; }
+
     public static OperationResult Success(string message = "") => new(true, message);
     public static OperationResult Fail(string message) => new(false, message);
 }
@@ -88,7 +95,10 @@ public sealed class AppController : IDisposable
 
     private readonly object _lock = new();
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _ops = new();
-    private readonly Dictionary<string, (AppState State, DateTime Until)> _lifecycle = new();
+    private readonly Dictionary<string, (AppState State, DateTime Until, DateTime Started)> _lifecycle = new();
+    private readonly Dictionary<string, TimeSpan> _startDurations = new();
+    private readonly HashSet<string> _openOnReady = new();
+    private readonly List<AppEntry> _readyToOpen = new();
     private readonly Dictionary<string, LaunchedProcess> _launched = new();
     private readonly Dictionary<string, DateTime> _userStopped = new();
     private readonly Dictionary<string, List<(ProcessIdentity Id, SafeProcessHandle Handle)>> _watch = new();
@@ -98,6 +108,9 @@ public sealed class AppController : IDisposable
     private readonly HashSet<string> _startedHere = new();
 
     public Registry Registry { get; private set; }
+
+    /// <summary>HTTP health checks for apps that configure one.</summary>
+    public HealthMonitor Health { get; } = new();
 
     public AppController(Registry registry) => Registry = registry;
 
@@ -114,12 +127,12 @@ public sealed class AppController : IDisposable
     public Snapshot Poll()
     {
         AppEntry[] apps;
-        GroupEntry[] groups;
+        WorkspaceEntry[] workspaces;
         HashSet<int> ignored;
         lock (Registry.SyncRoot)
         {
             apps = Registry.Apps.Select(a => a.Clone()).ToArray();
-            groups = Registry.Groups.Select(g => new GroupEntry { Id = g.Id, Name = g.Name, Apps = g.Apps.ToList(), OnFailure = g.OnFailure }).ToArray();
+            workspaces = Registry.Workspaces.Select(w => w.Clone()).ToArray();
             ignored = Registry.IgnoredPorts.ToHashSet();
         }
 
@@ -133,8 +146,23 @@ public sealed class AppController : IDisposable
             var mine = app.AllPorts.SelectMany(p => byPort[p]).Select(l => Classify(app, l, tree)).ToList();
             var primary = mine.Where(o => o.Listener.Port == app.Port).ToList();
             bool appOnPrimary = primary.Any(o => o.Ownership != Ownership.Foreign);
+
+            // Health: checked in the background while the app's own process is listening.
+            bool hasHealth = HealthUrl.Resolve(app) is not null;
+            bool starting;
+            lock (_lock) starting = _lifecycle.TryGetValue(app.Id, out var l0) && l0.State == AppState.Starting;
+            HealthSnapshot? health = null;
+            if (appOnPrimary && hasHealth)
+            {
+                var before = Health.Get(app.Id);
+                Health.MaybeCheck(app, urgent: starting && before?.Last?.Ok != true);
+                health = Health.Get(app.Id) ?? before;
+            }
+            else if (!appOnPrimary) Health.Reset(app.Id);
+
+            bool ready = appOnPrimary && (!hasHealth || health?.Last?.Ok == true);
             AppState state = app.Port is null ? AppState.NotConfigured
-                : appOnPrimary ? AppState.Up
+                : appOnPrimary ? (hasHealth && health is { ConsecutiveFailures: >= 2 } ? AppState.Degraded : AppState.Up)
                 : primary.Count > 0 ? AppState.Conflict
                 : AppState.Down;
 
@@ -144,20 +172,24 @@ public sealed class AppController : IDisposable
                 {
                     _launched.TryGetValue(app.Id, out var launched);
                     bool launcherFailed = lc.State == AppState.Starting && launched?.ExitCode is int code && code != 0 && !appOnPrimary;
-                    bool settled = (lc.State == AppState.Starting && appOnPrimary) ||
+                    bool settled = (lc.State == AppState.Starting && ready) ||
                                    (lc.State == AppState.Stopping && primary.Count == 0) ||
                                    launcherFailed || DateTime.UtcNow > lc.Until;
                     if (settled)
                     {
                         _lifecycle.Remove(app.Id);
-                        if (lc.State == AppState.Starting && !appOnPrimary)
+                        if (lc.State == AppState.Starting && !ready)
                             _lastError[app.Id] = launcherFailed
                                 ? $"The start command exited with code {launched!.ExitCode} before anything listened on :{app.Port}."
-                                : $"Nothing listened on :{app.Port} within {app.StartTimeoutSec} s.";
-                        if (lc.State == AppState.Starting && appOnPrimary)
+                                : appOnPrimary
+                                    ? $"Listening on :{app.Port}, but the health check didn't pass within {app.StartTimeoutSec} s ({health?.Describe() ?? "no answer"})."
+                                    : $"Nothing listened on :{app.Port} within {app.StartTimeoutSec} s.";
+                        if (lc.State == AppState.Starting && ready)
                         {
                             _lastError.Remove(app.Id);
+                            _startDurations[app.Id] = DateTime.UtcNow - lc.Started;
                             if (app.StartUnverified) _verifiedStarts.Add(app.Id);
+                            if (_openOnReady.Remove(app.Id)) _readyToOpen.Add(app);
                         }
                     }
                     else state = lc.State;
@@ -165,7 +197,7 @@ public sealed class AppController : IDisposable
             }
 
             var appProcs = mine.Where(o => o.Ownership != Ownership.Foreign && o.Identity is not null).Select(o => o.Identity!).DistinctBy(i => i.Pid).ToList();
-            DateTime? since = appProcs.Count > 0 && state == AppState.Up ? appProcs.Min(i => i.CreatedUtc).ToLocalTime() : null;
+            DateTime? since = appProcs.Count > 0 && state is AppState.Up or AppState.Degraded ? appProcs.Min(i => i.CreatedUtc).ToLocalTime() : null;
             long memory = 0;
             foreach (var id in appProcs)
             {
@@ -177,23 +209,36 @@ public sealed class AppController : IDisposable
                 catch { /* exited or restricted */ }
             }
 
-            TrackExits(app, state, appProcs);
+            TrackExits(app, state is AppState.Degraded ? AppState.Up : state, appProcs);
 
             ExitInfo? lastExit;
             string? lastError;
+            TimeSpan? duration;
             lock (_lock)
             {
                 _lastExit.TryGetValue(app.Id, out lastExit);
                 _lastError.TryGetValue(app.Id, out lastError);
+                duration = _startDurations.TryGetValue(app.Id, out var d) ? d : null;
             }
-            statuses.Add(new AppStatus(app, state, mine, since, memory, lastExit, lastError));
+            statuses.Add(new AppStatus(app, state, mine, since, memory, lastExit, lastError, health, duration));
         }
 
-        var groupStatuses = groups
-            .Select(g => new GroupStatus(g, g.Apps.Select(id => statuses.FirstOrDefault(s => s.App.Id == id)).Where(s => s is not null).Select(s => s!).ToList()))
+        var workspaceStatuses = workspaces
+            .Select(w => new WorkspaceStatus(w, w.Apps.Select(id => statuses.FirstOrDefault(s => s.App.Id == id)).Where(s => s is not null).Select(s => s!).ToList()))
             .ToList();
 
-        return new Snapshot(statuses, groupStatuses, Discover(listeners, apps, ignored), listeners);
+        return new Snapshot(statuses, workspaceStatuses, Discover(listeners, apps, ignored), listeners);
+    }
+
+    /// <summary>Apps that became ready after a dock Start and want their URL opened (the UI opens them).</summary>
+    public List<AppEntry> TakeReadyToOpen()
+    {
+        lock (_lock)
+        {
+            var list = _readyToOpen.ToList();
+            _readyToOpen.Clear();
+            return list;
+        }
     }
 
     /// <summary>
@@ -378,24 +423,41 @@ public sealed class AppController : IDisposable
     /// <summary>Starts and waits until the app's own process listens on its port (or fails/times out).</summary>
     public async Task<OperationResult> StartAndWaitAsync(AppEntry app, CancellationToken ct = default)
     {
+        var sw = Stopwatch.StartNew();
         var started = await StartAsync(app);
-        if (!started.Ok) return started.Message.Contains("already running") ? OperationResult.Success(started.Message) : started;
+        // "Already running" still has to prove it's ready (e.g. healthy) before dependents may start.
+        if (!started.Ok && !started.Message.Contains("already running")) return started;
         if (app.Port is not int port) return started;
 
+        bool hasHealth = HealthUrl.Resolve(app) is not null;
+        HealthSample? lastHealth = null;
         var until = DateTime.UtcNow + TimeSpan.FromSeconds(app.StartTimeoutSec);
         while (DateTime.UtcNow < until)
         {
             ct.ThrowIfCancellationRequested();
             var mine = PortTable.GetListeners().Where(l => l.Port == port).Select(l => Classify(app, l)).ToList();
-            if (mine.Any(o => o.Ownership != Ownership.Foreign)) return OperationResult.Success($"{app.Name} is up on :{port}.");
+            if (mine.Any(o => o.Ownership != Ownership.Foreign))
+            {
+                if (!hasHealth) return Ready("up");
+                lastHealth = await Health.CheckNowAsync(app, ct);
+                if (lastHealth.Ok) return Ready($"healthy ({lastHealth.LatencyMs:0} ms)");
+            }
 
             LaunchedProcess? launched;
             lock (_lock) _launched.TryGetValue(app.Id, out launched);
-            if (launched?.ExitCode is int code && code != 0)
+            if (launched?.ExitCode is int code && code != 0 && !mine.Any(o => o.Ownership != Ownership.Foreign))
                 return Fail(app, $"{app.Name}'s start command exited with code {code} before anything listened on :{port}.");
-            await Task.Delay(400, ct);
+            await Task.Delay(hasHealth ? 1000 : 400, ct);
         }
-        return Fail(app, $"{app.Name} didn't start listening on :{port} within {app.StartTimeoutSec} s.");
+        return lastHealth is not null
+            ? Fail(app, $"{app.Name} is listening on :{port}, but its health check didn't pass within {app.StartTimeoutSec} s ({(lastHealth.Status is int s ? "HTTP " + s : lastHealth.Error)}).")
+            : Fail(app, $"{app.Name} didn't start listening on :{port} within {app.StartTimeoutSec} s.");
+
+        OperationResult Ready(string how)
+        {
+            lock (_lock) _startDurations[app.Id] = sw.Elapsed;
+            return new OperationResult(true, $"{app.Name} is ready on :{port}, {how}, after {sw.Elapsed.TotalSeconds:0.0} s.") { Duration = sw.Elapsed };
+        }
     }
 
     private OperationResult StartCore(AppEntry app)
@@ -439,7 +501,9 @@ public sealed class AppController : IDisposable
             _userStopped.Remove(app.Id);
             _lastError.Remove(app.Id);
             _startedHere.Add(app.Id);
-            _lifecycle[app.Id] = (AppState.Starting, DateTime.UtcNow.AddSeconds(app.StartTimeoutSec));
+            _lifecycle[app.Id] = (AppState.Starting, DateTime.UtcNow.AddSeconds(app.StartTimeoutSec), DateTime.UtcNow);
+            if (app.OpenOnReady) _openOnReady.Add(app.Id);
+            Health.Reset(app.Id);
         }
         return OperationResult.Success($"Starting {app.Name}…");
     }
@@ -449,7 +513,8 @@ public sealed class AppController : IDisposable
         lock (_lock)
         {
             _userStopped[app.Id] = DateTime.UtcNow;
-            _lifecycle[app.Id] = (AppState.Stopping, DateTime.UtcNow.AddSeconds(app.GracefulTimeoutSec + 40));
+            _lifecycle[app.Id] = (AppState.Stopping, DateTime.UtcNow.AddSeconds(app.GracefulTimeoutSec + 40), DateTime.UtcNow);
+            _openOnReady.Remove(app.Id);
         }
         var notes = new List<string>();
         try
@@ -537,36 +602,101 @@ public sealed class AppController : IDisposable
     public Task<KillResult> KillAsync(ProcessIdentity confirmed) =>
         ProcessGuard.TerminateTreeAsync(confirmed, StopPolicy.Graceful, TimeSpan.FromSeconds(5));
 
-    // ================================================================ groups
+    // ================================================================ workspaces
 
     /// <summary>
-    /// Starts members in order, waiting for each to become ready. With OnFailure = "stop" (default), a member
-    /// that doesn't become ready stops the sequence so later members don't start against a missing dependency.
+    /// Starts a workspace dependencies-first. A member starts as soon as everything it depends on is ready
+    /// (listening and, if it has a health check, healthy), with up to MaxParallel starting at once. When a member
+    /// fails, its dependents never start; with OnFailure = "stop" (default) nothing new starts at all.
+    /// Each member's time-to-ready is measured, and the slowest is reported.
     /// </summary>
-    public async Task<OperationResult> StartGroupAsync(GroupEntry group, Action<string>? progress = null, CancellationToken ct = default)
+    public async Task<OperationResult> StartWorkspaceAsync(WorkspaceEntry ws, Action<string>? progress = null, CancellationToken ct = default)
     {
-        var failures = new List<string>();
-        foreach (var app in Members(group))
+        try { WorkspacePlan.Levels(ws); }
+        catch (InvalidOperationException ex) { return OperationResult.Fail(ex.Message); }
+
+        var members = Members(ws).ToDictionary(a => a.Id);
+        var pending = ws.Apps.Where(members.ContainsKey).ToList();
+        var ready = new HashSet<string>();
+        var failed = new Dictionary<string, string>();
+        var skipped = new List<string>();
+        var durations = new Dictionary<string, TimeSpan>();
+        var running = new Dictionary<Task<OperationResult>, string>();
+        string? haltedAt = null;
+
+        while (true)
         {
-            if (string.IsNullOrWhiteSpace(app.Start)) continue;
-            progress?.Invoke(app.Name);
-            var r = await StartAndWaitAsync(app, ct);
-            if (r.Ok) continue;
-            failures.Add(r.Message);
-            if (group.OnFailure != "continue")
-                return OperationResult.Fail($"Start all “{group.Name}” stopped at {app.Name}: {r.Message}");
+            if (haltedAt is null)
+            {
+                foreach (var id in pending.ToList())
+                {
+                    if (running.Count >= ws.MaxParallel) break;
+                    var deps = ws.DependenciesOf(id).Where(members.ContainsKey).ToList();
+                    if (deps.Any(d => failed.ContainsKey(d) || skipped.Contains(d)))
+                    {
+                        pending.Remove(id);
+                        skipped.Add(id); // its dependency failed: never start against a missing dependency
+                        continue;
+                    }
+                    if (!deps.All(ready.Contains)) continue;
+
+                    pending.Remove(id);
+                    var app = members[id];
+                    if (string.IsNullOrWhiteSpace(app.Start))
+                    {
+                        if (IsListeningAsApp(app)) ready.Add(id);
+                        else failed[id] = $"{app.Name} has no start command and isn't running.";
+                        continue;
+                    }
+                    progress?.Invoke(app.Name);
+                    running[StartAndWaitAsync(app, ct)] = id;
+                }
+            }
+            if (running.Count == 0) break;
+
+            var done = await Task.WhenAny(running.Keys);
+            string doneId = running[done];
+            running.Remove(done);
+            var r = await done;
+            if (r.Ok)
+            {
+                ready.Add(doneId);
+                if (r.Duration is { } d) durations[doneId] = d;
+            }
+            else
+            {
+                failed[doneId] = r.Message;
+                if (ws.OnFailure != "continue") haltedAt ??= doneId;
+            }
         }
-        return failures.Count == 0
-            ? OperationResult.Success($"“{group.Name}” is up.")
-            : OperationResult.Fail($"“{group.Name}” started with problems: {string.Join(" ", failures)}");
+        skipped.AddRange(pending);
+
+        string Name(string id) => members.TryGetValue(id, out var a) ? a.Name : id;
+        string slowest = durations.Count > 1
+            ? $" Slowest: {Name(durations.MaxBy(kv => kv.Value).Key)} ({durations.Values.Max().TotalSeconds:0.0} s)."
+            : "";
+        if (failed.Count == 0 && skipped.Count == 0)
+            return OperationResult.Success($"“{ws.Name}” is ready ({ready.Count} app{(ready.Count == 1 ? "" : "s")}).{slowest}");
+
+        string head = haltedAt is not null
+            ? $"Start “{ws.Name}” stopped at {Name(haltedAt)}: {failed[haltedAt]}"
+            : $"“{ws.Name}” started with problems: {string.Join(" ", failed.Select(f => f.Value))}";
+        string notStarted = skipped.Count > 0 ? $" Not started (a dependency failed): {string.Join(", ", skipped.Select(Name))}." : "";
+        return OperationResult.Fail(head + notStarted);
     }
 
-    /// <summary>Stops members one at a time in reverse start order (dependents before their dependencies).</summary>
-    public async Task<OperationResult> StopGroupAsync(GroupEntry group, ConfirmStop? confirm, CancellationToken ct = default)
+    /// <summary>Stops members one at a time, dependents before what they depend on.</summary>
+    public async Task<OperationResult> StopWorkspaceAsync(WorkspaceEntry ws, ConfirmStop? confirm, CancellationToken ct = default)
     {
+        List<string> order;
+        try { order = WorkspacePlan.StopOrder(ws); }
+        catch (InvalidOperationException) { order = ws.Apps.AsEnumerable().Reverse().ToList(); }
+
+        var members = Members(ws).ToDictionary(a => a.Id);
         var failures = new List<string>();
-        foreach (var app in Enumerable.Reverse(Members(group)))
+        foreach (var id in order)
         {
+            if (!members.TryGetValue(id, out var app)) continue;
             bool running = app.AllPorts.Any(p => PortTable.GetListeners().Any(l => l.Port == p));
             bool launched;
             lock (_lock) launched = _launched.ContainsKey(app.Id);
@@ -575,14 +705,17 @@ public sealed class AppController : IDisposable
             if (!r.Ok) failures.Add(r.Message);
         }
         return failures.Count == 0
-            ? OperationResult.Success($"“{group.Name}” stopped.")
+            ? OperationResult.Success($"“{ws.Name}” stopped.")
             : OperationResult.Fail(string.Join(" ", failures));
     }
 
-    private List<AppEntry> Members(GroupEntry group)
+    private bool IsListeningAsApp(AppEntry app) =>
+        app.Port is int p && PortTable.GetListeners().Where(l => l.Port == p).Select(l => Classify(app, l)).Any(o => o.Ownership != Ownership.Foreign);
+
+    private List<AppEntry> Members(WorkspaceEntry ws)
     {
         lock (Registry.SyncRoot)
-            return group.Apps.Select(Registry.ById).Where(a => a is not null).Select(a => a!.Clone()).ToList();
+            return ws.Apps.Select(Registry.ById).Where(a => a is not null).Select(a => a!.Clone()).ToList();
     }
 
     // ================================================================ helpers
@@ -615,5 +748,6 @@ public sealed class AppController : IDisposable
             foreach (var w in _watch.Values) foreach (var (_, h) in w) h.Dispose();
             _watch.Clear();
         }
+        Health.Dispose();
     }
 }

@@ -307,7 +307,115 @@ public static partial class AppDetector
             }, "Django project (manage.py), default port :8000."));
         }
 
+        // 4. Other frameworks, when nothing more specific was found.
+        if (results.Count == 0) results.AddRange(FromPythonWeb(dir));
+        if (results.Count == 0) results.AddRange(FromAspNet(dir));
+        if (results.Count == 0) results.AddRange(FromSpring(dir));
+        if (results.Count == 0) results.AddRange(FromRailsOrLaravel(dir));
+
         return results;
+    }
+
+    // ------------------------------------------------------------------ frameworks
+
+    /// <summary>FastAPI (uvicorn, :8000) and Flask (:5000) apps in main.py / app.py / server.py / api.py.</summary>
+    private static IEnumerable<Detection> FromPythonWeb(string dir)
+    {
+        string python = new[] { @".venv\Scripts\python.exe", @"venv\Scripts\python.exe", @"env\Scripts\python.exe" }
+            .Select(p => Path.Combine(dir, p)).FirstOrDefault(File.Exists) is { } venv ? $"\"{venv}\"" : "python";
+        foreach (string file in new[] { "main.py", "app.py", "server.py", "api.py", "asgi.py", "wsgi.py" })
+        {
+            string path = Path.Combine(dir, file);
+            if (!File.Exists(path) || new FileInfo(path).Length > 512 * 1024) continue;
+            string text = File.ReadAllText(path);
+            string module = Path.GetFileNameWithoutExtension(file);
+            var ports = PortsIn(text);
+
+            if (FastApiVar().Match(text) is { Success: true } fa)
+            {
+                int port = ports.FirstOrDefault(8000);
+                yield return new Detection(new AppEntry
+                {
+                    Name = FolderName(dir), Port = port, Cwd = dir,
+                    Start = $"{python} -m uvicorn {module}:{fa.Groups["v"].Value} --port {port}",
+                }, $"FastAPI app in {file}, served by uvicorn on :{port}.");
+                yield break;
+            }
+            if (FlaskVar().Match(text) is { Success: true })
+            {
+                int port = ports.FirstOrDefault(5000);
+                yield return new Detection(new AppEntry
+                {
+                    Name = FolderName(dir), Port = port, Cwd = dir,
+                    Start = $"{python} -m flask --app {module} run --port {port}",
+                }, $"Flask app in {file}, port :{port}.");
+                yield break;
+            }
+        }
+    }
+
+    /// <summary>ASP.NET Core: a Web SDK project; port from Properties\launchSettings.json.</summary>
+    private static IEnumerable<Detection> FromAspNet(string dir)
+    {
+        foreach (string proj in SafeFiles(dir, "*.csproj"))
+        {
+            string text = File.ReadAllText(proj);
+            if (!text.Contains("Microsoft.NET.Sdk.Web", StringComparison.OrdinalIgnoreCase)) continue;
+
+            int? port = null;
+            string settings = Path.Combine(dir, "Properties", "launchSettings.json");
+            if (File.Exists(settings) && HttpUrlPort().Match(File.ReadAllText(settings)) is { Success: true } m) port = int.Parse(m.Groups["p"].Value);
+            string start = $"dotnet run --project \"{proj}\"" + (port is null ? " --urls http://localhost:5000" : "");
+            port ??= 5000;
+            yield return new Detection(new AppEntry
+            {
+                Name = Path.GetFileNameWithoutExtension(proj), Port = port, Cwd = dir, Start = start,
+            }, File.Exists(settings) ? $"ASP.NET Core project, port :{port} from launchSettings.json." : "ASP.NET Core project; no launchSettings.json, so it's pinned to :5000.");
+            yield break;
+        }
+    }
+
+    /// <summary>Spring Boot (Maven or Gradle); port from application.properties/yml, default 8080.</summary>
+    private static IEnumerable<Detection> FromSpring(string dir)
+    {
+        string pom = Path.Combine(dir, "pom.xml");
+        string gradle = new[] { "build.gradle", "build.gradle.kts" }.Select(f => Path.Combine(dir, f)).FirstOrDefault(File.Exists) ?? "";
+        string? start = null;
+        if (File.Exists(pom) && File.ReadAllText(pom).Contains("spring-boot", StringComparison.OrdinalIgnoreCase))
+            start = File.Exists(Path.Combine(dir, "mvnw.cmd")) ? "mvnw.cmd spring-boot:run" : "mvn spring-boot:run";
+        else if (gradle.Length > 0 && File.ReadAllText(gradle).Contains("org.springframework.boot", StringComparison.OrdinalIgnoreCase))
+            start = File.Exists(Path.Combine(dir, "gradlew.bat")) ? "gradlew.bat bootRun" : "gradle bootRun";
+        if (start is null) yield break;
+
+        int port = 8080;
+        foreach (var cfg in new[] { "application.properties", "application.yml", "application.yaml" })
+        {
+            string path = Path.Combine(dir, "src", "main", "resources", cfg);
+            if (File.Exists(path) && PortsIn(File.ReadAllText(path)) is { Count: > 0 } p) { port = p[0]; break; }
+        }
+        yield return new Detection(new AppEntry { Name = FolderName(dir), Port = port, Cwd = dir, Start = start },
+            $"Spring Boot project ({start.Split(' ')[0]}), port :{port}.");
+    }
+
+    /// <summary>Rails (bin\rails server, :3000) and Laravel (php artisan serve, :8000).</summary>
+    private static IEnumerable<Detection> FromRailsOrLaravel(string dir)
+    {
+        string gemfile = Path.Combine(dir, "Gemfile");
+        if (File.Exists(gemfile) && RailsGem().IsMatch(File.ReadAllText(gemfile)) && File.Exists(Path.Combine(dir, "bin", "rails")))
+        {
+            yield return new Detection(new AppEntry { Name = FolderName(dir), Port = 3000, Cwd = dir, Start = @"ruby bin\rails server -p 3000" },
+                "Rails app, default port :3000.");
+            yield break;
+        }
+        if (File.Exists(Path.Combine(dir, "artisan")) && File.Exists(Path.Combine(dir, "composer.json")))
+            yield return new Detection(new AppEntry { Name = FolderName(dir), Port = 8000, Cwd = dir, Start = "php artisan serve --port=8000" },
+                "Laravel app (php artisan serve), port :8000.");
+    }
+
+    private static IEnumerable<string> SafeFiles(string dir, string pattern)
+    {
+        try { return Directory.GetFiles(dir, pattern); }
+        catch { return Array.Empty<string>(); }
     }
 
     private static List<Detection> FromPackageJson(string dir)
@@ -537,6 +645,18 @@ public static partial class AppDetector
 
     [GeneratedRegex(@"^(?:start|launch|run|serve|dev)\b|[\s\-_](?:start|launch|run|serve)$", RegexOptions.IgnoreCase)]
     private static partial Regex PsLauncherName();
+
+    [GeneratedRegex(@"^(?<v>\w+)\s*(?::\s*\w+\s*)?=\s*FastAPI\(", RegexOptions.Multiline)]
+    private static partial Regex FastApiVar();
+
+    [GeneratedRegex(@"^(?<v>\w+)\s*(?::\s*\w+\s*)?=\s*Flask\(", RegexOptions.Multiline)]
+    private static partial Regex FlaskVar();
+
+    [GeneratedRegex(@"""applicationUrl""\s*:\s*""[^""]*?http://(?:localhost|127\.0\.0\.1|\*|\+|0\.0\.0\.0):(?<p>\d{2,5})")]
+    private static partial Regex HttpUrlPort();
+
+    [GeneratedRegex(@"^\s*gem\s+['""]rails['""]", RegexOptions.Multiline)]
+    private static partial Regex RailsGem();
 
     [GeneratedRegex(@"\s-(?:lt|gt|le|ge|eq|ne)\s|[<>]|[=!]=", RegexOptions.IgnoreCase)]
     private static partial Regex ComparisonOperator();

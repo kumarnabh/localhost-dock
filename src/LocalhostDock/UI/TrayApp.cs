@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using LocalhostDock.Core;
 using LocalhostDock.Integration;
+using LocalhostDock.Workspace;
 using Registry = LocalhostDock.Config.Registry;
 
 namespace LocalhostDock.UI;
@@ -24,6 +25,12 @@ internal sealed class TrayApp : ApplicationContext
     // The click action of the most recent toast, valid only while it can still be the one clicked.
     private (Action? Action, DateTime Until) _balloon;
     private FileSystemWatcher? _watcher;
+    private string _sessionKey = "";
+    private bool _restoreOffered;
+    // The session as it was when the dock started (before anything overwrites it), and until when we hold off
+    // writing a new one so an unanswered restore offer isn't lost.
+    private readonly SessionFile? _previousSession = SessionStore.Load();
+    private DateTime _holdSessionUntil = DateTime.UtcNow.AddMinutes(10);
     private readonly System.Windows.Forms.Timer _reloadDebounce = new() { Interval = 600 };
 
     public TrayApp(string[] args)
@@ -138,6 +145,9 @@ internal sealed class TrayApp : ApplicationContext
             UpdateTray(snap);
             NotifyTransitions(snap);
             RecordVerifiedStarts();
+            foreach (var app in _controller.TakeReadyToOpen()) _controller.Open(app);
+            if (!_restoreOffered) { _restoreOffered = true; OfferRestore(snap); }
+            SaveSession(snap);
             _dock.Render(snap);
         }
         catch (Exception ex)
@@ -192,14 +202,23 @@ internal sealed class TrayApp : ApplicationContext
                 Notify($"{app.Name} didn't start", (s.LastError ?? $"Nothing listened on :{app.Port}.") + " Click to view logs.",
                     () => LogViewer.ShowFor(app), ToolTipIcon.Warning);
             }
+            else if (before == AppState.Up && s.State == AppState.Degraded)
+            {
+                Notify($"{app.Name} is unhealthy", $"Its health check is failing: {s.Health?.Describe()}. It's still running.", _dock.ShowNearTray, ToolTipIcon.Warning);
+            }
+            else if (mode == "all" && before == AppState.Degraded && s.State == AppState.Up)
+            {
+                Notify($"{app.Name} is healthy again", s.Health?.Describe() ?? "", null);
+            }
             else if (before is AppState.Down or AppState.Up && s.State == AppState.Conflict)
             {
                 Notify($"{app.Name}: port :{app.Port} taken", $"{s.ForeignHolder?.Identity?.ToString() ?? "Another program"} is listening on it. Click for details.",
                     _dock.ShowNearTray, ToolTipIcon.Warning);
             }
-            else if (mode == "all" && before == AppState.Starting && s.State == AppState.Up)
+            else if (mode == "all" && before == AppState.Starting && s.State == AppState.Up && !app.OpenOnReady)
             {
-                Notify($"{app.Name} is up", app.EffectiveUrl is { } url ? $"{url}  (click to open)" : $":{app.Port}",
+                string took = s.LastStartDuration is { } d ? $" (ready in {d.TotalSeconds:0.0} s)" : "";
+                Notify($"{app.Name} is up{took}", app.EffectiveUrl is { } url ? $"{url}  (click to open)" : $":{app.Port}",
                     app.EffectiveUrl is not null ? () => _controller.Open(app) : null);
             }
         }
@@ -256,16 +275,16 @@ internal sealed class TrayApp : ApplicationContext
         if (_last is { } snap && snap.Apps.Count > 0)
         {
             menu.Items.Add(new ToolStripSeparator());
-            foreach (var g in snap.Groups)
+            foreach (var w in snap.Workspaces)
             {
-                var gi = new ToolStripMenuItem($"▣  {g.Group.Name}  ({g.Up}/{g.Members.Count})");
-                gi.DropDownItems.Add(DarkMenu.Item("Start all", () => _dock.ActGroup(g.Group, "start"), g.Up < g.Members.Count));
-                gi.DropDownItems.Add(DarkMenu.Item("Stop all", () => _dock.ActGroup(g.Group, "stop"), g.Up > 0));
-                menu.Items.Add(gi);
+                var wi = new ToolStripMenuItem($"▣  {w.Workspace.Name}  ({w.Up}/{w.Members.Count})");
+                wi.DropDownItems.Add(DarkMenu.Item("Start workspace", () => _dock.ActWorkspace(w.Workspace, "start"), w.Up < w.Members.Count));
+                wi.DropDownItems.Add(DarkMenu.Item("Stop workspace", () => _dock.ActWorkspace(w.Workspace, "stop"), w.Members.Any(m => m.State is AppState.Up or AppState.Degraded)));
+                menu.Items.Add(wi);
             }
             foreach (var s in snap.Apps)
             {
-                string mark = s.State switch { AppState.Up => "●", AppState.Down => "○", AppState.NotConfigured => "·", _ => "◐" };
+                string mark = s.State switch { AppState.Up => "●", AppState.Down => "○", AppState.NotConfigured => "·", AppState.Degraded or AppState.Conflict => "⚠", _ => "◐" };
                 var item = new ToolStripMenuItem($"{mark}  {s.App.Name}" + (s.App.Port is int p ? $"   :{p}" : ""));
                 if (s.State == AppState.Up) item.ForeColor = Theme.Up;
                 bool up = s.State == AppState.Up, hasStart = s.App.Start is not null;
@@ -279,6 +298,8 @@ internal sealed class TrayApp : ApplicationContext
         }
 
         menu.Items.Add(new ToolStripSeparator());
+        if (_last is { } s2 && SessionStore.Candidates(_previousSession, s2.Apps).Count > 0)
+            menu.Items.Add(DarkMenu.Item("Restore last session…", () => OfferRestore(_last!, ask: true)));
         menu.Items.Add(DarkMenu.Item("Add from a launcher or folder…", _dock.PickAndAdd));
         menu.Items.Add(DarkMenu.Item("Scan a folder for apps…", () => _dock.ScanFolder()));
         menu.Items.Add(DarkMenu.Item("Edit apps.json", OpenRegistryFile));
@@ -297,6 +318,13 @@ internal sealed class TrayApp : ApplicationContext
             var n = DarkMenu.Item(label, () => SetNotifications(mode));
             n.Checked = _controller.Registry.Notifications.Equals(mode, StringComparison.OrdinalIgnoreCase);
             settings.DropDownItems.Add(n);
+        }
+        settings.DropDownItems.Add(new ToolStripSeparator());
+        foreach (var (mode, label) in new[] { ("ask", "After a restart: offer to restore running apps"), ("auto", "After a restart: restore running apps automatically"), ("off", "After a restart: don't restore") })
+        {
+            var r = DarkMenu.Item(label, () => { _controller.Mutate(reg => reg.RestoreSession = mode); TrySave(); });
+            r.Checked = _controller.Registry.RestoreSession == mode;
+            settings.DropDownItems.Add(r);
         }
         settings.DropDownItems.Add(new ToolStripSeparator());
         settings.DropDownItems.Add(DarkMenu.Item($"Shortcut: {(_controller.Registry.Hotkey is { Length: > 0 } h ? h : "none")} (edit in apps.json)", () => { }, enabled: false));
@@ -357,8 +385,72 @@ internal sealed class TrayApp : ApplicationContext
         else ExplorerMenu.Install();
     }
 
+    // ================================================================ session
+
+    /// <summary>Remembers which apps are running (only when that set changes), so they can be restored later.</summary>
+    private void SaveSession(Snapshot snap, bool cleanExit = false)
+    {
+        // While a restore offer is pending, keep the previous session file as it is.
+        if (!cleanExit && DateTime.UtcNow < _holdSessionUntil) return;
+        var running = snap.Apps.Where(a => a.State is AppState.Up or AppState.Degraded).Select(a => a.App.Id).OrderBy(x => x).ToList();
+        string key = string.Join(",", running) + cleanExit;
+        if (key == _sessionKey) return;
+        _sessionKey = key;
+        SessionStore.Save(running, cleanExit);
+    }
+
+    /// <summary>
+    /// After a reboot or crash: apps that were running and are now down. Never stops anything, never restarts an
+    /// app that's already up, and (in auto mode) never runs an unverified start command.
+    /// </summary>
+    private void OfferRestore(Snapshot snap, bool ask = false)
+    {
+        string mode = _controller.Registry.RestoreSession;
+        if (mode == "off" && !ask) return;
+        var session = _previousSession;
+        var candidates = SessionStore.Candidates(session, snap.Apps);
+        if (session is null || candidates.Count == 0)
+        {
+            _holdSessionUntil = DateTime.MinValue; // nothing to offer: start recording right away
+            return;
+        }
+        // Remember the session as it was before this restore offer replaces it.
+        var savedAt = session.SavedUtc;
+
+        if (mode == "auto" && !ask)
+        {
+            var safe = candidates.Where(a => !a.StartUnverified).ToList();
+            _holdSessionUntil = DateTime.MinValue;
+            if (safe.Count > 0) _ = RestoreAsync(safe);
+            return;
+        }
+        if (!ask)
+        {
+            Notify("Restore your last session?",
+                $"{string.Join(", ", candidates.Select(c => c.Name).Take(4))}{(candidates.Count > 4 ? "…" : "")} {(candidates.Count == 1 ? "was" : "were")} running before. Click to choose.",
+                () => OfferRestore(_last ?? snap, ask: true));
+            return;
+        }
+        using var dialog = new RestoreDialog(candidates, savedAt);
+        var answer = dialog.ShowDialog();
+        _holdSessionUntil = DateTime.MinValue; // answered either way
+        if (answer == DialogResult.OK && dialog.Selected.Count > 0) _ = RestoreAsync(dialog.Selected);
+    }
+
+    private async Task RestoreAsync(List<Config.AppEntry> apps)
+    {
+        List<Config.WorkspaceEntry> workspaces;
+        lock (_controller.Registry.SyncRoot) workspaces = _controller.Registry.Workspaces.Select(w => w.Clone()).ToList();
+        // Start them as one temporary workspace, keeping the dependencies your workspaces declare between them.
+        var plan = WorkspacePlan.Combine("Last session", apps.Select(a => a.Id).ToList(), workspaces);
+        var result = await _controller.StartWorkspaceAsync(plan, _ => PollNow());
+        Notify(result.Ok ? "Session restored" : "Session partly restored", result.Message, _dock.ShowNearTray, result.Ok ? ToolTipIcon.Info : ToolTipIcon.Warning);
+        PollNow();
+    }
+
     protected override void ExitThreadCore()
     {
+        if (_last is { } final) SaveSession(final, cleanExit: true);
         _timer.Stop();
         _watcher?.Dispose();
         _reloadDebounce.Dispose();

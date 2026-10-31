@@ -12,14 +12,22 @@ Detailed status of the 110-item upgrade backlog: **[docs/BACKLOG-STATUS.md](docs
 - [x] Safe log capture (no shell redirection), rotation; hardened single-instance pipe
 - [x] .NET 10; staged installer with self-test and rollback; self-contained release; hashes; CI vulnerability gate
 
-## Next (batch 2: workspaces and health)
+## v0.4: shipped (workspaces and health)
 
-- [ ] HTTP health/readiness checks (`health`), degraded state, latency
-- [ ] Workspace profiles, dependency graphs, session restore
-- [ ] Port-conflict wizard (reassign / free the port)
+- [x] Workspaces with dependency graphs, parallel starts, failure policies; session restore
+- [x] HTTP health/readiness checks, degraded state, latency; open when ready; time-to-ready
+- [x] Port-conflict wizard (free the port / move to a free port)
+- [x] FastAPI, Flask, ASP.NET Core, Spring Boot, Rails, Laravel detection
+- [x] `ldock` read-only CLI with versioned JSON (status, who, workspaces, manifest)
+
+## Next (batch 3: monitoring and integrations)
+
 - [ ] Auto-restart with back-off and crash-loop protection
-- [ ] Machine-readable CLI (`status --json`) and a read-only MCP interface
-- [ ] Per-monitor DPI v2, keyboard navigation, light theme
+- [ ] Log search, severity filters, merged multi-app timeline
+- [ ] CPU and per-process-tree resource usage, bounded history
+- [ ] Docker / Compose services and WSL as apps
+- [ ] Read-only MCP interface on top of the CLI; then permission-gated agent actions with an audit trail
+- [ ] Per-monitor DPI v2, full keyboard navigation, light theme
 
 ## v0.2: shipped
 

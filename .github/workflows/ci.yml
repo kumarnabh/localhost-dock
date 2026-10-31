@@ -42,11 +42,15 @@ jobs:
       - name: Publish (framework-dependent and self-contained)
         shell: pwsh
         run: |
-          dotnet publish src/LocalhostDock/LocalhostDock.csproj -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true -o publish/fd
-          dotnet publish src/LocalhostDock/LocalhostDock.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:EnableCompressionInSingleFile=true -o publish/sc
+          foreach ($proj in 'src/LocalhostDock/LocalhostDock.csproj', 'src/ldock/ldock.csproj') {
+            dotnet publish $proj -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true -o publish/fd
+            dotnet publish $proj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:EnableCompressionInSingleFile=true -o publish/sc
+          }
           foreach ($d in 'fd', 'sc') {
             $p = Start-Process "publish/$d/LocalhostDock.exe" -ArgumentList '--selftest' -PassThru -Wait
             if ($p.ExitCode -ne 0) { throw "$d build failed its self-test ($($p.ExitCode))" }
+            & "publish/$d/ldock.exe" version
+            if ($LASTEXITCODE -ne 0) { throw "$d ldock.exe failed to run" }
           }
 
       - uses: actions/upload-artifact@v6

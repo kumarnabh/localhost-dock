@@ -39,17 +39,19 @@ public class RegistryTests : IDisposable
             """);
         var reg = Registry.Load();
 
-        Assert.Equal(2, reg.SchemaVersion);
+        Assert.True(reg.SchemaVersion >= 2);
         var api = reg.Find("API")!;
         var web = reg.Find("Web")!;
-        Assert.Equal(new[] { api.Id, web.Id }, reg.Groups[0].Apps);
+        Assert.Equal(new[] { api.Id, web.Id }, reg.Workspaces[0].Apps);
+        Assert.Equal(new[] { api.Id }, reg.Workspaces[0].DependenciesOf(web.Id)); // old group order kept as a dependency chain
+        Assert.Equal(3, reg.SchemaVersion);
         Assert.Contains(reg.LoadWarnings, w => w.Contains("Upgraded"));
         Assert.Contains(reg.LoadWarnings, w => w.Contains("Missing"));
-        Assert.Contains(Directory.GetFiles(Registry.BackupFolder), f => f.Contains("pre-v2"));
+        Assert.Contains(Directory.GetFiles(Registry.BackupFolder), f => f.Contains("pre-v3"));
 
         // Renaming no longer breaks groups.
         api.Name = "Backend";
-        Assert.Equal(api.Id, reg.Groups[0].Apps[0]);
+        Assert.Equal(api.Id, reg.Workspaces[0].Apps[0]);
     }
 
     [Fact]
@@ -74,7 +76,7 @@ public class RegistryTests : IDisposable
         Assert.Equal("minimized", reg.Apps[0].Window);
         Assert.Equal("graceful", reg.Apps[0].StopPolicy);
         Assert.Equal(new[] { 4000 }, reg.Apps[1].ExtraPorts);               // dupes, 0 and the primary removed
-        Assert.NotNull(reg.Groups);
+        Assert.NotNull(reg.Workspaces);
         Assert.Equal(new[] { 80 }, reg.IgnoredPorts);
         Assert.Equal("all", reg.Notifications);
         Assert.Equal(500, reg.PollMs);

@@ -1,42 +1,62 @@
 # How it works
 
-Localhost Dock is a single-process WinForms app (.NET 10) with no service, no admin rights and no network access.
+Localhost Dock is a WinForms tray app plus a read-only CLI, both on one engine library (.NET 10). It has no service and needs no admin rights. Its only network traffic is the health checks you configure, and those reach this machine only.
 
 ```
-src/LocalhostDock/
-├── Program.cs                   single instance; forwards --show / --add / --exit; --selftest
-├── Config/Registry.cs           apps.json model (schema v2, ids), migration, normalization, backups,
-│                                corruption recovery, conflict-safe atomic save
+src/LocalhostDock.Core/              the engine (no UI): used by the app, the CLI and the tests
+├── Config/Registry.cs               apps.json model (schema v3: ids, workspaces), migration, normalization,
+│                                    backups, corruption recovery, conflict-safe atomic save, read-only load
 ├── Core/
-│   ├── AppController.cs         polling → Snapshot (status + ownership, uptime, memory, crashes, groups,
-│   │                            discovered); serialized Start/Stop/Restart; group start/stop with policies
-│   ├── Launcher.cs              command-line building; windowed launch; log-capturing launch (CreateProcess
-│   │                            with inherited file handles); log rotation; launched-process pinning
-│   └── AppDetector.cs           launcher / project folder / running process → suggested AppEntry; folder scan
-├── Net/
-│   ├── ProcessGuard.cs          THE termination path: identity revalidation, protection, graceful → force
-│   ├── ProcessIdentity.cs       PID + creation time + image; verified process trees (PID-reuse safe)
-│   ├── ProcessCwd.cs            another process's working directory (ownership evidence)
-│   ├── PortTable.cs             TCP listener table via iphlpapi!GetExtendedTcpTable (IPv4 + IPv6, per binding)
-│   ├── ProcessInfo.cs           process details via WMI, cached by identity, with restriction explanations
-│   ├── ExcludedPorts.cs         Windows-reserved port ranges via netsh
-│   └── Native.cs                Win32 declarations
-├── Integration/
-│   ├── SingleInstance.cs        per-user mutex + named pipe for forwarded arguments
-│   ├── Hotkey.cs                global shortcut (RegisterHotKey)
-│   └── ExplorerMenu.cs          optional per-user "Add to Localhost Dock" context-menu entries
+│   ├── AppController.cs             polling → Snapshot (status + ownership + health, uptime, memory, crashes,
+│   │                                workspaces, discovered); serialized Start/Stop/Restart; readiness;
+│   │                                dependency-aware workspace start/stop
+│   ├── Launcher.cs                  command lines; windowed and log-capturing launches; log rotation
+│   ├── AppDetector.cs               launcher / project folder / running process → suggested AppEntry; scan
+│   └── PortAdvisor.cs               free-port suggestions; rewriting explicit ports in start commands
+├── Health/HealthMonitor.cs          local-only HTTP health checks, bounded history, latency, availability
+├── Workspace/
+│   ├── WorkspacePlan.cs             dependency graph: start levels, stop order, cycles, dependents
+│   └── SessionStore.cs              which apps were running (session restore)
+├── Cli/CliRunner.cs                 `ldock` commands and versioned JSON schemas, secret redaction
+└── Net/
+    ├── ProcessGuard.cs              THE termination path: identity revalidation, protection, graceful → force
+    ├── ProcessIdentity.cs           PID + creation time + image; verified process trees (PID-reuse safe)
+    ├── ProcessCwd.cs                another process's working directory (ownership evidence)
+    ├── PortTable.cs                 TCP listener table (IPv4 + IPv6, per binding)
+    ├── ProcessInfo.cs               process details via WMI, cached by identity
+    ├── ExcludedPorts.cs             Windows-reserved port ranges via netsh
+    └── Native.cs                    Win32 declarations
+
+src/LocalhostDock/                   the tray app
+├── Program.cs                       single instance; forwards --show / --add / --exit; --selftest
+├── Integration/                     single-instance pipe, global hotkey, Explorer menu
 └── UI/
-    ├── TrayApp.cs               NotifyIcon, tray quick-control menu, poll timer, toasts, settings
-    ├── DockForm.cs              the popup: search, sections, add flows, drag-drop, port lookup
-    ├── Rows.cs                  AppRow, GroupRow, DiscoveredRow (hover rows with icon buttons)
-    ├── AppEditor.cs             add/edit dialog with live detection and port checks
-    ├── ImportDialog.cs          "Scan a folder for apps" checklist
-    ├── GroupEditor.cs           create/edit start groups
-    ├── LogViewer.cs             live tail of captured or app-written logs
-    ├── DarkMenu.cs, Theme.cs    dark palette, icon font, DPI scaling helper, tray icon
-    └── Shell.cs                 VS Code / Windows Terminal helpers
+    ├── TrayApp.cs                   tray icon/menu, poll timer, toasts, open-on-ready, session save/restore
+    ├── DockForm.cs                  the popup: search, sections, add flows, drag-drop, conflicts, port lookup
+    ├── Rows.cs                      AppRow (health, conflict), WorkspaceRow (readiness), DiscoveredRow
+    ├── AppEditor.cs                 add/edit with live detection, port checks, health, stop policy
+    ├── WorkspaceEditor.cs           members, per-member dependencies, failure policy, parallelism, live order
+    ├── ConflictWizard.cs            port conflict: who holds it, stop it, or move to a free port; RestoreDialog
+    ├── ImportDialog.cs, LogViewer.cs, DarkMenu.cs, Theme.cs, Shell.cs
+
+src/ldock/                           thin console host for CliRunner
 ```
 
+## Health and readiness
+
+`HealthMonitor` runs each app's check in the background at its interval, but only while the app's own process holds its port. Each check is a `GET` with its own timeout. It uses no proxy and follows no redirects (3xx counts as healthy, but never leads off-machine). `localhost` is connected on IPv4 and IPv6 at once, and the first to answer wins. That avoids Windows' slow IPv6-first fallback when a dev server bound only `127.0.0.1`. The last 120 samples are kept per app.
+
+**Ready** means listening *and* healthy (when a check is configured). It's what settles a Start, what `StartAndWaitAsync` waits for, and what workspace dependents wait on. A running app whose last two checks failed is **degraded**. Every start records its time-to-ready.
+
+## Workspaces
+
+`WorkspacePlan.Levels` is Kahn's algorithm, with member order breaking ties. `StartWorkspaceAsync` doesn't run level by level. It starts each member *as soon as* everything it depends on is ready, with at most `maxParallel` in flight. When a member fails, its transitive dependents are marked "not started". With `onFailure: "stop"`, nothing new is launched at all; in-flight starts are allowed to finish. `StopWorkspaceAsync` walks the reverse order one app at a time through the normal ownership-checked Stop.
+
+Session restore builds a temporary workspace from the apps to restore (`WorkspacePlan.Combine`). It keeps only the dependencies your workspaces declare between those apps, so a restore starts things in a sensible order.
+
+## CLI
+
+`CliRunner` loads the registry with `Registry.Load(readOnly: true)`. That reads, migrates and normalizes **in memory only**: it creates, backs up, repairs and saves nothing, and `Save()` throws. It then polls once with a fresh `AppController`, which has no launch records, so ownership comes from the working directory and command line. Output records are versioned (`localhost-dock/status@1`, `who@1`, `manifest@1`). Start/stop commands pass through pattern-based secret redaction.
 ## The poll loop
 
 Every `pollMs` (2 s by default), `TrayApp` runs `AppController.Poll()` on a thread-pool thread:
@@ -107,11 +127,12 @@ It ships in the .NET Desktop Runtime, starts in well under a second, idles at a 
 
 ## Testing
 
-`tests/LocalhostDock.Tests` (xUnit, 71 tests, run by CI before every release):
+`tests/LocalhostDock.Tests` (xUnit, 117 tests, run by CI before every release):
 
 - **Safety** (`SafetyTests`, 15 tests). An unrelated process on an app's port survives Stop, with or without a confirmation callback, unless the user explicitly confirms. Working-directory ownership is stopped without asking. Recycled PIDs and changed executables are refused. Protected/service processes are refused, even unopenable ones. Graceful-only never forces. Concurrent operations are serialized. Restart doesn't start after an incomplete stop. Port takeover becomes a conflict and blocks Start. Crash detection uses exit code and identity, and a user stop isn't a crash. Group stop is sequential in reverse order; group start stops at a failed dependency, or continues by policy.
 - **Registry** (`RegistryTests`): seeding, v1 → v2 migration with backup, normalization of bad data, corrupt-file recovery, outside edits never overwritten, newer schema refused, backup rotation, collision-free log names.
 - **Detection** (`DetectorTests`): launchers and the scripts they call, paths with spaces, two-port launchers, PowerShell-only projects, `.cmd`-over-`.ps1` preference, npm/monorepo/Vite, process → project tracing with unverified flag and port-mismatch note, folder scans, port grammar positives and false-positive rejections.
+- **Batch 2** (`BatchTwoTests`, `UiSmokeTests`): health URL rules (local only), real HTTP checks (200/503/timeout, latency, bounded history, no slow localhost fallback), degraded state, readiness waiting for health, dependency levels/stop order/cycles, parallel starts with dependents waiting and `maxParallel` enforced, v2 → v3 migration, read-only load, session candidates, port suggestions and start-command rewriting, CLI schemas/ownership/health/redaction/exit codes/never-writes, FastAPI/Flask/ASP.NET/Spring/Rails/Laravel detection. The four dialogs are also rendered **off-screen** and checked for controls that collapse or overflow.
 - **Core/features:** listener table (including separate IPv4/IPv6 bindings), process details with identity, end-to-end Start → up → Stop → down with a launcher whose path has spaces, `&` and parentheses, duplicate-launch refusal, discovery (no system processes), log capture without shell redirection (stdout, stderr, `pause` not hanging), log rotation, command-line quoting, and pipe argument sanitizing.
 
 Test processes are real (`node`/`powershell` listeners). `TestProcesses` records the identity of everything a test starts and cleans up **only those**, through `ProcessGuard`. The test assembly points `LOCALHOST_DOCK_HOME` at a throwaway folder before any test runs and disables parallelism, so a test run can never touch your real registry.

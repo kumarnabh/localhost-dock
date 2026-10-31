@@ -8,13 +8,13 @@ Localhost Dock reads a single file:
 
 Set the `LOCALHOST_DOCK_HOME` environment variable to use a different folder, for example to keep the registry in a synced folder or to try out a demo registry. Captured logs go in a `logs` folder next to it.
 
-You rarely need to edit this file. Adding (drag-drop, *Scan a folder*, *Discovered → Add*, Explorer's right-click), editing (**⋯ → Edit…**), groups, ordering, Ignore and notification settings are all saved for you. To edit by hand, use tray menu → **Edit apps.json**. The dock notices the change and reloads it.
+You rarely need to edit this file. Adding (drag-drop, *Scan a folder*, *Discovered → Add*, Explorer's right-click), editing (**⋯ → Edit…**), workspaces, ordering, Ignore and notification settings are all saved for you. To edit by hand, use tray menu → **Edit apps.json**. The dock notices the change and reloads it.
 
 **Your edits are safe:**
 - The dock never overwrites a change made outside it. If you edited the file while the dock had unsaved changes, it keeps yours on disk, reloads, and tells you.
 - Every save first keeps the previous version in `backups\` (the last 20).
 - If `apps.json` becomes unreadable, it's kept as `apps.corrupt-<time>.json` and the newest readable backup is restored. A toast tells you.
-- Problems the dock can fix (duplicate names, invalid ports, unknown values, group members that don't exist) are fixed on load and listed in a toast.
+- Problems the dock can fix (duplicate names, invalid ports, unknown values, workspace members that don't exist, dependency loops) are fixed on load and listed in a toast.
 
 JSON comments (`//`, `/* */`) and trailing commas are allowed. Note that saving from the dock rewrites the file without comments, and leaves out fields that are at their default.
 
@@ -22,20 +22,21 @@ JSON comments (`//`, `/* */`) and trailing commas are allowed. Note that saving 
 
 | Field | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `schemaVersion` | number | `2` | File format version. Older files (no field) are migrated on load, with the original backed up as `backups\apps-…-pre-v2.json`. A file from a *newer* version is refused rather than misread |
+| `schemaVersion` | number | `3` | File format version. Older files are migrated on load (schema 2 → 3 turns groups into workspaces), with the original backed up as `backups\apps-…-pre-v3.json`. A file from a *newer* version is refused rather than misread |
 | `apps` | array | `[]` | Your apps, in the order they appear in the dock |
-| `groups` | array | `[]` | Start groups (see below) |
+| `workspaces` | array | `[]` | Workspaces: apps started together, dependencies first (see below) |
 | `ignoredPorts` | number[] | `[]` | Ports never offered under *Discovered* (filled by **Ignore**) |
 | `pollMs` | number | `2000` | How often to refresh status, in milliseconds (minimum 500) |
 | `hotkey` | string | `"Ctrl+Alt+L"` | Global shortcut that opens the dock: modifiers `Ctrl`, `Alt`, `Shift`, `Win` plus one key (`L`, `F12`, `D1`/`1`, `Space`, …). `""` disables it |
 | `notifications` | string | `"all"` | `"all"` (crashes, failed starts, successful starts), `"crashes"` (crashes and failed starts only), or `"off"` |
+| `restoreSession` | string | `"ask"` | After a reboot/crash: `"ask"`, `"auto"` or `"off"` (see [Session restore](#session-restore)) |
 | `scanFolders` | string[] | `[]` | The last few folders you scanned (pre-fills *Scan a folder*) |
 
 ## App fields
 
 | Field | Type | Required | Meaning |
 | --- | --- | --- | --- |
-| `id` | string | auto | Stable identity, generated if missing. Groups and runtime state use it, so renaming an app is safe. Don't reuse one |
+| `id` | string | auto | Stable identity, generated if missing. Workspaces and runtime state use it, so renaming an app is safe. Don't reuse one |
 | `name` | string | yes | Display name. Must be unique |
 | `port` | number | no* | Primary port. The dot is green when *this app's* process listens on it (see [Ownership](#ownership)) |
 | `extraPorts` | number[] | no | Other ports that belong to the app, e.g. the API behind a web front end. Shown on the row and freed by Stop |
@@ -50,22 +51,65 @@ JSON comments (`//`, `/* */`) and trailing commas are allowed. Note that saving 
 | `gracefulTimeoutSec` | number | no | Seconds to wait for a graceful exit (default 8, 1–300) |
 | `startTimeoutSec` | number | no | Seconds to wait for the port after Start (default 90, 5–1800) |
 | `startUnverified` | bool | no | Set when the start command was reconstructed from a running process. You're asked before it first runs, and it clears itself after a start that works |
+| `health`, `healthIntervalSec`, `healthTimeoutMs`, `openOnReady` | | no | See [Health checks](#health-checks) |
 
 \* An app without a `port` still shows in the dock (grey dot) so you can keep a placeholder. Open, Stop and Restart need a port.
 
-## Groups
+## Workspaces
 
 ```json
-"groups": [
-  { "id": "…", "name": "Shop dev", "apps": ["<api id>", "<web id>", "<worker id>"], "onFailure": "stop" }
+"workspaces": [
+  {
+    "id": "…", "name": "Shop dev",
+    "apps": ["<api id>", "<web id>", "<worker id>"],
+    "dependsOn": { "<web id>": ["<api id>"], "<worker id>": ["<api id>"] },
+    "onFailure": "stop",
+    "maxParallel": 4
+  }
 ]
 ```
 
-- `apps` holds app **ids** in start order. When editing by hand you may write app **names**; they're converted to ids on load.
-- **Start all** starts members in order. Each must become *ready* (its own process listening on its port, within its `startTimeoutSec`) before the next starts. If a member fails (its start command exits with an error, or it times out) and `onFailure` is `"stop"` (default), the sequence stops there, so nothing starts against a missing dependency. With `"continue"` it carries on and reports the failures at the end. Members that are already up are skipped.
-- **Stop all** stops members **one at a time in reverse order**, each verified before the next.
-- An app can be in several groups. Renaming an app changes nothing in its groups, and removing an app removes it from them.
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `apps` | | Member app **ids**. When editing by hand you may write app **names**; they're converted to ids on load |
+| `dependsOn` | `{}` | app → the members it needs to be *ready* before it starts. Missing means no dependencies. Loops are removed on load, with a warning |
+| `onFailure` | `"stop"` | When a member fails to become ready: `"stop"` starts nothing more; `"continue"` starts everything that doesn't (directly or indirectly) depend on the failed app |
+| `maxParallel` | `4` | How many members may be starting at the same time (1–16) |
 
+- **Start** starts each member as soon as everything it depends on is **ready**, so independent members start in parallel. *Ready* means its own process is listening on its port and, if it has a `health` check, the check passes, within its `startTimeoutSec`.
+- A member whose start command exits with an error fails immediately. Nothing that depends on a failed member is ever started. Members that are already ready are skipped.
+- **Stop** stops members one at a time, dependents before what they depend on, each verified before the next.
+- After Start, the toast says how many are ready and which member was slowest; the workspace row tooltip shows the start order.
+- An app can be in several workspaces. Renaming an app changes nothing in them, and removing an app removes it (and its dependencies) from them.
+
+**From groups (schema 1–2):** each old group becomes a workspace where every member depends on the one before it, so it starts in exactly the old order.
+
+## Health checks
+
+| App field | Default | Meaning |
+| --- | --- | --- |
+| `health` | — | A path (`/healthz`, checked at `http://localhost:{port}`) or a full URL on **this machine** (`localhost`, `*.localhost`, `127.x.x.x`, `[::1]`). Anything else is rejected, and turned off on load |
+| `healthIntervalSec` | `10` | Seconds between checks while the app is running (2–3600) |
+| `healthTimeoutMs` | `3000` | Per-check timeout (200–60000) |
+| `openOnReady` | `false` | Open the app's URL in the browser once a Start from the dock becomes ready |
+
+**How checks work:**
+- A `GET` that answers 2xx or 3xx is healthy. Redirects are not followed, and no proxy is used.
+- `localhost` is tried on IPv4 and IPv6 at the same time, so a server bound to only one of them doesn't cost a slow fallback.
+- The last 120 results are kept for latency and availability.
+
+**What it changes:**
+- **Ready** (for Start, Restart and workspaces) means healthy, not just listening.
+- **Degraded:** a running app whose last two checks failed is shown as degraded (orange, with the status) and triggers a toast. Another toast says when it recovers.
+
+## Session restore
+
+`restoreSession` (top level): `"ask"` (default), `"auto"` or `"off"`.
+
+The dock remembers which apps are running (`session.json` next to `apps.json`). When it starts after a reboot or a crash, the apps that were running but are now stopped are offered back. It never stops anything, never touches apps that are already up, and starts them using the dependencies your workspaces declare between them.
+- **Ask:** a toast; click it to pick which to start. Unverified start commands are unticked.
+- **Auto:** starts them without asking, skipping unverified start commands.
+- **Tray menu → *Restore last session…*** works anytime there's something to restore.
 ## How Start works
 
 `start` is either a **path to a file** or **any command line**.

@@ -2,7 +2,7 @@
 
 A Windows tray widget for every local app and dev server you run: whether each one is up or down, and one-click control.
 
-<p align="center"><img src="docs/screenshot.png" alt="Localhost Dock panel: a start group, apps with status dots, uptime and memory, and icon buttons for open, start, stop, restart and more" width="460"></p>
+<p align="center"><img src="docs/screenshot.png" alt="Localhost Dock panel: a workspace with per-app readiness, a healthy API, a degraded app with a failing health check, and a port conflict" width="460"></p>
 
 If you keep a handful of local tools running (an API on `:8765`, a dashboard on `:4780`, a Next.js monorepo, a Vite server you forgot about), Localhost Dock puts them all one click from the tray. A global shortcut (<kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>L</kbd>) opens it too.
 
@@ -24,7 +24,7 @@ You don't have to write config. Give Localhost Dock a launcher or a project fold
 - **Launchers** (`.cmd`, `.bat`, `.ps1`): it reads the launcher *and the scripts it calls* (`%~dp0scripts\start.ps1`, `$PSScriptRoot\…`) for ports (`--port 8000`, `$Port = 8765`, `-p 3001`, `http://127.0.0.1:4780`, …). It also finds a matching stop script (`Start-X.cmd` → `Stop-X.cmd`, `X-Start.ps1` → `X-Stop.ps1`).
 - **Node projects:** it picks the `dev` / `start` / `serve` / `preview` script and follows it into the files it runs, `vite.config.*`, or the framework default (Next 3000, Vite 5173, Astro 4321, Angular 4200, …). It uses `npm`, `pnpm`, `yarn` or `bun` to match your lockfile.
 - **Monorepos:** each `dev:<name>` script becomes its own app, with the port read from the workspace it runs (`npm run dev -w apps/web` → `apps/web/package.json`).
-- **Django** (`manage.py`) and plain `python -m http.server` / `uvicorn` scripts are recognised too.
+- **Other frameworks:** FastAPI (`uvicorn`, using your `.venv` if there is one), Flask, Django (`manage.py`), ASP.NET Core (port from `launchSettings.json`), Spring Boot (`mvnw`/`gradlew`, port from `application.properties`), Rails and Laravel.
 
 It only suggests. Every field stays editable, and the dialog warns you when a port is already used by another app, held by a running process, or reserved by Windows.
 
@@ -33,16 +33,37 @@ It only suggests. Every field stays editable, and the dialog warns you when a po
 **Status and control**
 - A green, red or amber dot per app, plus **uptime and memory** (`:8765 · up 2h 14m · 142 MB`).
 - Icon buttons for **Open**, **Start**, **Stop** and **Restart**. Hover any of them for a label. Double-click a row to open it.
-- **⋯ menu** per app: *View logs*, *Copy URL*, *Open folder*, *Open in VS Code*, *Open terminal here*, *Add to group*, *Move up/down*, *Edit*, *Duplicate*, *Remove*.
+- **⋯ menu** per app: *View logs*, *Copy URL*, *Open folder*, *Open in VS Code*, *Open terminal here*, *Add to workspace*, *Move up/down*, *Edit*, *Duplicate*, *Remove* (plus *Resolve port conflict* when there is one).
 - **Search box:** type to filter, then <kbd>Enter</kbd> opens the first match. <kbd>Ctrl</kbd>+<kbd>N</kbd> adds an app, <kbd>Esc</kbd> closes.
-- **Tray right-click menu:** start, stop, restart or open any app or group without opening the dock.
+- **Tray right-click menu:** start, stop, restart or open any app or workspace without opening the dock.
 
-**Start groups.** "Shop dev" = API + web + worker. **Start all** brings them up in order, waiting for each one's port before starting the next. **Stop all** stops them in reverse order.
+**Workspaces.** "Shop dev" = API + web + worker, started with one click.
+- Say what each app needs first (Web needs API, Worker needs API). **Start** brings the API up, waits until it's *ready*, then starts Web and Worker *together*. You can limit how many start at once.
+- If a member fails, nothing that depends on it starts. You choose whether the rest carries on or everything stops.
+- **Stop** goes in reverse, one app at a time. The workspace row shows each member's readiness (`API ✓ · Web … · Worker ✗`), and a toast tells you which member was slowest to become ready.
+
+**Health checks.** Give an app a health URL (`/healthz`) and "running" starts to mean *healthy*, not just "something is listening":
+- Workspace dependencies wait for health.
+- An app whose checks fail turns **degraded**, with a toast and the HTTP status.
+- The row shows latency (`healthy · 3 ms`).
+- Checks only ever go to this machine.
+
+**Port conflicts, solved.** When an app's port is taken, its row says by what. Click it (or press Start) for a wizard that shows the program and its folder, and offers to:
+- **Stop it** safely, or stop the other app it belongs to;
+- **Move this app** to a suggested free port. Any explicit `--port`/`-p` in its start command is rewritten for you.
+
+<p align="center"><img src="docs/conflict-wizard.png" alt="Port conflict wizard: names the program holding the port and its folder, offers to stop it or move the app to a free port" width="520"></p>
+
+**Session restore.** After a reboot or crash, the dock offers to start again the apps that were running. It respects workspace dependencies and never touches what's already up. You can make it automatic, or turn it off.
+
+**`ldock` command line.** Read-only, machine-readable status for scripts and AI coding agents: `ldock status --json`, `ldock who 5173`, and `ldock manifest` (with secrets redacted). See [docs/CLI.md](docs/CLI.md).
 
 **Notifications.**
 - **Crash toast** when an app goes down without you stopping it. Click it to restart.
 - **Didn't start** when nothing came up within 90 s. Click it to view the logs.
-- **Is up** when a start finishes. Click it to open the app.
+- **Is up** when a start finishes (with how long it took). Click it to open the app, or set *Open in the browser once it's ready* on the app.
+- **Unhealthy / healthy again** when a health check starts failing or recovers.
+- **Port taken** when another program grabs an app's port.
 
 You can switch to crashes-only, or turn them off, in tray menu → *Settings*.
 
@@ -54,7 +75,7 @@ You can switch to crashes-only, or turn them off, in tray menu → *Settings*.
 
 **Your launchers stay yours.** Localhost Dock runs your existing `.cmd` files exactly as a double-click would, and never edits them.
 
-It's a single small .NET 10 WinForms executable. It has no background service, needs no admin rights and sends nothing over the network.
+It's a small .NET 10 WinForms app plus the `ldock` CLI. It has no background service, needs no admin rights and sends nothing over the network.
 
 ## Install
 
@@ -84,11 +105,13 @@ Upgrading is safe to run over a working install. The new build is staged and sel
 | Find an app | Just type; <kbd>Enter</kbd> opens the first match |
 | Add an app | Drop a launcher/folder on the dock, **+ Add**, <kbd>Ctrl</kbd>+<kbd>N</kbd>, or **Add** on a discovered port |
 | Add many apps | **+ Add → Scan a folder for apps…** |
-| Edit, logs, folder, VS Code, groups | The **⋯** button (or right-click) on a row |
-| Make a group | **+ Add → New group…**, or **⋯ → Add to group → New group…** |
+| Edit, logs, folder, VS Code, workspaces | The **⋯** button (or right-click) on a row |
+| Make a workspace | **+ Add → New workspace…**, or **⋯ → Add to workspace → New workspace…**; set dependencies in its editor |
+| Fix a port conflict | Click the app's orange "port held by…" line, or press Start |
+| Status from a script / agent | `ldock status --json` (see [docs/CLI.md](docs/CLI.md)) |
 | Find who holds a port | *Who's on port* at the bottom; <kbd>Enter</kbd> |
 | Quick control from the tray | Right-click the tray icon |
-| Settings | Tray menu → *Settings* (autostart, Explorer menu, notifications) |
+| Settings | Tray menu → *Settings* (autostart, Explorer menu, notifications, session restore) |
 
 ### What the dot means
 
@@ -96,14 +119,15 @@ Upgrading is safe to run over a working install. The new build is staged and sel
 | --- | --- |
 | 🟢 | The app's own process is listening on its `port` (started by the dock, or running from the app's folder). *“owner unverified”* means something is listening but its details can't be read |
 | 🔴 | Not running. The subtitle says *crashed (exit code N)* or *failed: …* when it didn't go down by your hand |
-| 🟠 | **Port conflict:** another program holds the app's port. The subtitle names it; Start is blocked until the port is free |
+| 🟠 | **Degraded:** running, but its health check is failing (the subtitle shows the HTTP status) |
+| 🟠 | **Port conflict:** another program holds the app's port. The subtitle names it; click it to resolve |
 | 🟠 | Starting or stopping (subtitle says so): waiting for the port to open or close (start gives up after `startTimeoutSec`, 90 s by default) |
 | ⚪ | No `port` configured, so status can't be known |
 | 🔵 | A discovered port that isn't in your dock |
 
-For groups, a filled dot means all members are up, a ring means some are, and red means none are.
+For workspaces, a filled dot means every member is ready, a ring means some are, and red means none are. Orange means one of them has a problem.
 
-Status comes from the OS TCP listener table, polled every 2 seconds by default. Nothing makes HTTP requests to your apps.
+Status comes from the OS TCP listener table, polled every 2 seconds by default. The only HTTP requests are the health checks you configure, and those go to this machine only (localhost, 127.x, ::1).
 
 ## Configuration
 
@@ -113,9 +137,9 @@ Everything lives in `%APPDATA%\LocalhostDock\apps.json`, and the dock edits it f
 {
   "apps": [
     { "name": "Asset library", "port": 8765, "start": "C:\\dev\\assets\\Start-Assets.cmd", "stop": "C:\\dev\\assets\\Stop-Assets.cmd" },
-    { "name": "Web", "port": 5280, "start": "npm run dev", "cwd": "C:\\dev\\web", "captureLogs": true }
+    { "name": "Web", "port": 5280, "start": "npm run dev", "cwd": "C:\\dev\\web", "health": "/healthz", "openOnReady": true }
   ],
-  "groups": [ { "name": "Shop dev", "apps": ["Asset library", "Web"] } ],
+  "workspaces": [ { "name": "Shop dev", "apps": ["Asset library", "Web"], "dependsOn": { "Web": ["Asset library"] } } ],
   "hotkey": "Ctrl+Alt+L",
   "notifications": "all"
 }
@@ -132,10 +156,12 @@ Stopping processes is the one dangerous thing this app does, so it's built aroun
 - **Graceful first.** The app is asked to exit (window close and Ctrl+C) and is force-stopped only after `gracefulTimeoutSec`. Set `stopPolicy: "graceful-only"` for apps that must never be force-killed. Child processes go too, so an `npm run dev` doesn't leave an orphaned `node.exe`.
 - **Protected, always:** Windows system processes, services, Localhost Dock itself and the program that started it. They can't be stopped from the dock, even when Windows won't let it inspect them, and they never appear under *Discovered*.
 - **Kill** (Who's on port / Discovered) always asks first, showing the process, PID, port and command line.
-- **One operation at a time per app.** Restart only starts again once the stop is verified complete, and group stops go one app at a time, in reverse order.
+- **One operation at a time per app.** Restart only starts again once the stop is verified complete, and workspace stops go one app at a time, dependents first.
 - **Your config is protected.** Edits made outside the dock are never overwritten. Every save keeps a backup, a corrupt `apps.json` is recovered from the newest good backup, and schema upgrades back up the original first.
 - Detection only *reads* your files. Nothing is saved until you press Save or Add.
-- Your registry and logs stay on your machine. Localhost Dock makes no network calls.
+- Your registry and logs stay on your machine. Localhost Dock makes no network calls beyond your own health checks, which only reach this machine.
+- The **conflict wizard** shows exactly what holds a port before offering to stop it, and its buttons ignore clicks for a moment after it appears, so a stray click can't choose for you.
+- `ldock` is read-only: it can't start, stop or change anything.
 
 These rules are covered by a dedicated safety test suite that CI runs before any release (see [docs/BACKLOG-STATUS.md](docs/BACKLOG-STATUS.md)).
 
@@ -144,6 +170,7 @@ These rules are covered by a dedicated safety test suite that CI runs before any
 - [Configuration reference](docs/CONFIGURATION.md)
 - [How it works](docs/ARCHITECTURE.md)
 - [Troubleshooting](docs/TROUBLESHOOTING.md)
+- [Command line (`ldock`)](docs/CLI.md)
 - [Upgrade backlog status](docs/BACKLOG-STATUS.md)
 - [Roadmap](ROADMAP.md) · [Changelog](CHANGELOG.md) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)
 

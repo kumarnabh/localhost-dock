@@ -17,6 +17,8 @@ internal sealed class AppEditor : Form
     private readonly ComboBox _window, _candidates;
     private readonly CheckBox _capture;
     private readonly ComboBox _stopPolicy;
+    private readonly TextBox _health;
+    private readonly CheckBox _openOnReady;
     private readonly NumericUpDown _grace;
     private readonly string? _originalStart;
     private int _detectGeneration;
@@ -83,6 +85,11 @@ internal sealed class AppEditor : Form
         grid.Controls.Add(Filler());
 
         _url = Field(grid, "URL", app.Url ?? "", "blank = http://localhost:{port}");
+        _health = Field(grid, "Health check", app.Health ?? "", "optional: /healthz or http://localhost:3000/health");
+        grid.Controls.Add(Filler());
+        _openOnReady = new CheckBox { Text = "Open in the browser once it's ready (after Start)", Checked = app.OpenOnReady, AutoSize = true, Margin = new Padding(S(3), 0, 0, S(6)) };
+        grid.Controls.Add(_openOnReady);
+        grid.Controls.Add(Filler());
         _start = Field(grid, "Start", app.Start ?? "", "launcher path, or a command like npm run dev", browse: true);
         _stop = Field(grid, "Stop", app.Stop ?? "", "optional; blank = kill whatever holds the ports", browse: true);
         _cwd = Field(grid, "Working dir", app.Cwd ?? "", "blank = the launcher's folder", folder: true);
@@ -256,6 +263,14 @@ internal sealed class AppEditor : Form
         _app.Window = (string)_window.SelectedItem!;
         _app.CaptureLogs = _capture.Checked;
         _app.LogFile = NullIfBlank(_logFile.Text);
+        string? health = NullIfBlank(_health.Text);
+        if (health is not null && LocalhostDock.Health.HealthUrl.Resolve(new AppEntry { Health = health, Port = port }) is null)
+        {
+            Warn("The health check must be a path starting with / (checked on this app's port) or a URL on this machine (localhost, 127.0.0.1 or ::1).");
+            return;
+        }
+        _app.Health = health;
+        _app.OpenOnReady = _openOnReady.Checked;
         _app.StopPolicy = _stopPolicy.SelectedIndex switch { 1 => "graceful-only", 2 => "force", _ => "graceful" };
         _app.GracefulTimeoutSec = (int)_grace.Value;
         // Editing the start command by hand counts as reviewing it.

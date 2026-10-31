@@ -2,6 +2,37 @@
 
 All notable changes to this project are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] - 2026-10-31
+
+Batch 2 of the upgrade backlog: workspaces and health. Per-item status is in [docs/BACKLOG-STATUS.md](docs/BACKLOG-STATUS.md).
+
+### Added
+
+- **Workspaces** replace groups: members plus per-member `dependsOn`. Start launches each app as soon as its dependencies are *ready*, independent apps in parallel (`maxParallel`). Dependents of a failed app never start; `onFailure` is `stop` or `continue`. Stop goes dependents-first, one at a time. There's a workspace editor with a live start order, per-member readiness on the row, and the slowest member is reported. Groups are migrated automatically (schema v3) as dependency chains.
+- **HTTP health checks** (`health`, `healthIntervalSec`, `healthTimeoutMs`), local-only. Ready means healthy; a new **degraded** state; latency and availability; unhealthy and recovered toasts.
+- **Port-conflict wizard:** shows who holds the port; stop it safely, stop the app it belongs to, or move this app to a suggested free port (rewriting `--port`/`-p`/`PORT=` in its start command).
+- **Session restore** after a reboot or crash (`restoreSession`: ask / auto / off), respecting workspace dependencies.
+- **Open when ready** (`openOnReady`), and time-to-ready on every start.
+- **`ldock` CLI:** read-only `status`, `who`, `workspaces` and `manifest`, with versioned JSON schemas and secret redaction (docs/CLI.md). Shipped next to the app.
+- Detection of FastAPI, Flask, ASP.NET Core, Spring Boot, Rails and Laravel projects.
+- Off-screen UI smoke tests for the dialogs.
+
+### Changed
+
+- The engine is now a separate library (`LocalhostDock.Core`) shared by the app, the CLI and the tests.
+- `apps.json` is written with readable characters (`"Ctrl+Alt+L"`, not `Ctrl+Alt+L`).
+- Stop lights up only when something of the app's own is running (or its port is in conflict), not when a stranger sits on an extra port.
+
+### Fixed
+
+- **Accessibility:** dock buttons couldn't be activated by keyboard, screen readers or UI Automation.
+- The workspace editor's settings no longer overflow the window.
+
+### Security
+
+- The conflict wizard's action buttons ignore clicks for 0.6 s after it appears, so a click meant for another window can't stop a process.
+- Health checks refuse any URL that isn't on this machine, and those settings are turned off on load.
+
 ## [0.3.0] - 2026-10-31
 
 Batch 1 of the upgrade backlog: process-control safety and correctness. Per-item status is in [docs/BACKLOG-STATUS.md](docs/BACKLOG-STATUS.md).

@@ -73,10 +73,11 @@ if ($Rollback) {
 
 # ---- 1. build into staging
 $staging = Join-Path ([IO.Path]::GetTempPath()) ("LocalhostDock-staging-" + [Guid]::NewGuid().ToString('N').Substring(0, 8))
-$project = Join-Path $PSScriptRoot 'src\LocalhostDock\LocalhostDock.csproj'
 $sc = if ($SelfContained) { 'true' } else { 'false' }
-dotnet publish $project -c Release -r win-x64 --self-contained $sc -p:PublishSingleFile=true -o $staging
-if ($LASTEXITCODE -ne 0) { throw 'dotnet publish failed; nothing was changed.' }
+foreach ($proj in 'src\LocalhostDock\LocalhostDock.csproj', 'src\ldock\ldock.csproj') {
+    dotnet publish (Join-Path $PSScriptRoot $proj) -c Release -r win-x64 --self-contained $sc -p:PublishSingleFile=true -o $staging
+    if ($LASTEXITCODE -ne 0) { throw 'dotnet publish failed; nothing was changed.' }
+}
 
 # ---- 2. validate before touching the installed version
 $newExe = Join-Path $staging 'LocalhostDock.exe'
@@ -86,6 +87,8 @@ if ($test.ExitCode -ne 0) {
     Remove-Item $staging -Recurse -Force
     throw "The new build failed its self-test (exit code $($test.ExitCode)); your current version was left running."
 }
+& (Join-Path $staging 'ldock.exe') version | Out-Null
+if ($LASTEXITCODE -ne 0) { Remove-Item $staging -Recurse -Force; throw "The new ldock.exe doesn't run; your current version was left running." }
 $version = (Get-Item $newExe).VersionInfo.ProductVersion
 
 # ---- 3. swap, keeping the current version for rollback
@@ -106,6 +109,7 @@ $lnk.Save()
 if (Start-AndVerify $exe) {
     Write-Host "Installed Localhost Dock $version to $target and started it. Look for the dock icon in the system tray."
     if (Test-Path $previous) { Write-Host "The previous version is kept; '.\install.ps1 -Rollback' restores it." }
+    Write-Host "Command line: $target\ldock.exe status   (add that folder to PATH to type just 'ldock')"
     return
 }
 

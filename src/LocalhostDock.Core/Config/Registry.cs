@@ -55,6 +55,21 @@ public sealed class AppEntry
     /// </summary>
     public bool StartUnverified { get; set; }
 
+    /// <summary>
+    /// HTTP health check: a path ("/healthz", checked on http://localhost:{port}) or a full URL on this machine
+    /// (localhost / 127.x / ::1 only). A 2xx or 3xx answer is healthy. When set, "ready" means healthy, not just listening.
+    /// </summary>
+    public string? Health { get; set; }
+
+    /// <summary>Seconds between health checks while the app is up (default 10, 2–3600).</summary>
+    public int HealthIntervalSec { get; set; } = 10;
+
+    /// <summary>Health check timeout in milliseconds (default 3000, 200–60000).</summary>
+    public int HealthTimeoutMs { get; set; } = 3000;
+
+    /// <summary>Open the URL in the browser once a Start from the dock becomes ready.</summary>
+    public bool OpenOnReady { get; set; }
+
     [JsonIgnore]
     public IEnumerable<int> AllPorts => (Port is int p ? new[] { p } : Array.Empty<int>()).Concat(ExtraPorts).Distinct();
 
@@ -90,34 +105,72 @@ public sealed class AppEntry
         Id = Id, Name = Name, Port = Port, ExtraPorts = ExtraPorts.ToList(), Url = Url, Start = Start, Stop = Stop,
         Cwd = Cwd, Window = Window, CaptureLogs = CaptureLogs, LogFile = LogFile, StopPolicy = StopPolicy,
         GracefulTimeoutSec = GracefulTimeoutSec, StartTimeoutSec = StartTimeoutSec, StartUnverified = StartUnverified,
+        Health = Health, HealthIntervalSec = HealthIntervalSec, HealthTimeoutMs = HealthTimeoutMs, OpenOnReady = OpenOnReady,
     };
 }
 
-/// <summary>A named set of apps started (in order) and stopped (in reverse) together.</summary>
-public sealed class GroupEntry
+/// <summary>
+/// A workspace: a named set of apps with a dependency graph. Start brings apps up dependencies-first (apps whose
+/// dependencies are ready start in parallel, up to <see cref="MaxParallel"/>); Stop goes dependents-first.
+/// </summary>
+public sealed class WorkspaceEntry
 {
     public string Id { get; set; } = "";
     public string Name { get; set; } = "";
 
-    /// <summary>Member app ids, in start order. (Names are accepted when hand-editing and converted on load.)</summary>
+    /// <summary>Member app ids (display order). Names are accepted when hand-editing and converted on load.</summary>
     public List<string> Apps { get; set; } = new();
 
-    /// <summary>"stop" (default): abort Start all when a member doesn't become ready. "continue": carry on.</summary>
+    /// <summary>app id → ids of the members it needs to be ready first. Missing = no dependencies.</summary>
+    public Dictionary<string, List<string>> DependsOn { get; set; } = new();
+
+    /// <summary>"stop" (default): when a member fails, start nothing more. "continue": start everything whose dependencies are ready.</summary>
     public string OnFailure { get; set; } = "stop";
+
+    /// <summary>How many members may start at the same time (default 4, 1–16).</summary>
+    public int MaxParallel { get; set; } = 4;
+
+    public List<string> DependenciesOf(string appId) => DependsOn.TryGetValue(appId, out var d) ? d : new();
+
+    public WorkspaceEntry Clone() => new()
+    {
+        Id = Id, Name = Name, Apps = Apps.ToList(), OnFailure = OnFailure, MaxParallel = MaxParallel,
+        DependsOn = DependsOn.ToDictionary(kv => kv.Key, kv => kv.Value.ToList()),
+    };
+
+    /// <summary>A workspace whose members start one after another in list order (how v0.3 groups behaved).</summary>
+    public static WorkspaceEntry Chain(string id, string name, List<string> apps, string onFailure)
+    {
+        var ws = new WorkspaceEntry { Id = id, Name = name, Apps = apps.ToList(), OnFailure = onFailure };
+        for (int i = 1; i < apps.Count; i++) ws.DependsOn[apps[i]] = new() { apps[i - 1] };
+        return ws;
+    }
 }
 
 public sealed class RegistryConflictException(string message) : Exception(message);
 
 public sealed class Registry
 {
-    public const int CurrentSchema = 2;
+    public const int CurrentSchema = 3;
 
     /// <summary>Schema version of the file. Missing = 1 (v0.1/v0.2 files), migrated on load.</summary>
     public int SchemaVersion { get; set; } = CurrentSchema;
 
     public List<AppEntry> Apps { get; set; } = new();
 
-    public List<GroupEntry> Groups { get; set; } = new();
+    public List<WorkspaceEntry> Workspaces { get; set; } = new();
+
+    /// <summary>Schema 1–2 "groups" (ordered lists). Read only to migrate them into workspaces; never written.</summary>
+    [JsonPropertyName("groups")]
+    public List<LegacyGroup>? LegacyGroups { get; set; }
+
+    public sealed class LegacyGroup
+    {
+        public string Id { get; set; } = "";
+        public string Name { get; set; } = "";
+        public List<string> Apps { get; set; } = new();
+        public string OnFailure { get; set; } = "stop";
+    }
 
     /// <summary>Ports the "discovered" list should never offer (you clicked Ignore).</summary>
     public List<int> IgnoredPorts { get; set; } = new();
@@ -131,6 +184,12 @@ public sealed class Registry
     /// <summary>Tray notifications: "all" (crashes + started), "crashes", or "off".</summary>
     public string Notifications { get; set; } = "all";
 
+    /// <summary>
+    /// After a reboot or crash, apps that were running: "ask" (default: offer to start them again), "auto" (start
+    /// them, skipping unverified start commands) or "off".
+    /// </summary>
+    public string RestoreSession { get; set; } = "ask";
+
     /// <summary>Folders remembered from "Scan folder for apps".</summary>
     public List<string> ScanFolders { get; set; } = new();
 
@@ -142,6 +201,7 @@ public sealed class Registry
 
     // Hash of the file as we last read/wrote it; a different hash on disk means someone else edited it.
     [JsonIgnore] private string? _diskHash;
+    [JsonIgnore] private bool _readOnly;
 
     public AppEntry? Find(string idOrName) =>
         Apps.FirstOrDefault(a => a.Id == idOrName) ??
@@ -176,8 +236,15 @@ public sealed class Registry
     public void Remove(AppEntry app)
     {
         Apps.RemoveAll(a => a.Id == app.Id);
-        foreach (var g in Groups) g.Apps.RemoveAll(id => id == app.Id);
+        foreach (var w in Workspaces)
+        {
+            w.Apps.RemoveAll(id => id == app.Id);
+            w.DependsOn.Remove(app.Id);
+            foreach (var deps in w.DependsOn.Values) deps.RemoveAll(id => id == app.Id);
+        }
     }
+
+    public WorkspaceEntry? WorkspaceById(string id) => Workspaces.FirstOrDefault(w => w.Id == id);
 
     public static string NewId() => Guid.NewGuid().ToString("N")[..10];
 
@@ -191,7 +258,7 @@ public sealed class Registry
     {
         var notes = new List<string>();
         Apps ??= new();
-        Groups ??= new();
+        Workspaces ??= new();
         IgnoredPorts ??= new();
         ScanFolders ??= new();
 
@@ -228,33 +295,70 @@ public sealed class Registry
             if (a.StopPolicy is not ("graceful" or "graceful-only" or "force")) a.StopPolicy = "graceful";
             a.GracefulTimeoutSec = Math.Clamp(a.GracefulTimeoutSec <= 0 ? 8 : a.GracefulTimeoutSec, 1, 300);
             a.StartTimeoutSec = Math.Clamp(a.StartTimeoutSec <= 0 ? 90 : a.StartTimeoutSec, 5, 1800);
+            a.HealthIntervalSec = Math.Clamp(a.HealthIntervalSec <= 0 ? 10 : a.HealthIntervalSec, 2, 3600);
+            a.HealthTimeoutMs = Math.Clamp(a.HealthTimeoutMs <= 0 ? 3000 : a.HealthTimeoutMs, 200, 60000);
+            if (string.IsNullOrWhiteSpace(a.Health)) a.Health = null;
+            else if (Health.HealthUrl.Resolve(a) is null)
+            {
+                notes.Add($"{a.Name}: health check “{a.Health}” isn't a path or a URL on this machine (localhost, 127.x, ::1), so it was turned off.");
+                a.Health = null;
+            }
         }
 
         foreach (var clash in Apps.Where(a => a.Port is not null).GroupBy(a => a.Port).Where(g => g.Count() > 1))
             notes.Add($"Port :{clash.Key} is used by {string.Join(" and ", clash.Select(a => a.Name))}; only one can run at a time.");
 
-        var groupIds = new HashSet<string>();
-        var groupNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        Groups.RemoveAll(g => g is null || string.IsNullOrWhiteSpace(g.Name));
-        foreach (var g in Groups)
+        // Schema 1–2 groups become workspaces whose members depend on the previous one (same start order as before).
+        if (LegacyGroups is { Count: > 0 })
+            foreach (var g in LegacyGroups.Where(g => g is not null && !string.IsNullOrWhiteSpace(g.Name)))
+            {
+                var members = (g.Apps ?? new()).Select(m => Find(m)?.Id ?? m).ToList();
+                Workspaces.Add(WorkspaceEntry.Chain(string.IsNullOrWhiteSpace(g.Id) ? NewId() : g.Id, g.Name, members, g.OnFailure ?? "stop"));
+            }
+        LegacyGroups = null;
+
+        var wsIds = new HashSet<string>();
+        var wsNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        Workspaces.RemoveAll(w => w is null || string.IsNullOrWhiteSpace(w.Name));
+        foreach (var w in Workspaces)
         {
-            g.Apps ??= new();
-            if (string.IsNullOrWhiteSpace(g.Id) || !groupIds.Add(g.Id)) { g.Id = NewId(); groupIds.Add(g.Id); }
-            if (!groupNames.Add(g.Name.Trim())) { g.Name += $" ({g.Id[..4]})"; groupNames.Add(g.Name); }
-            if (g.OnFailure is not ("stop" or "continue")) g.OnFailure = "stop";
+            w.Apps ??= new();
+            w.DependsOn ??= new();
+            w.Name = w.Name.Trim();
+            if (string.IsNullOrWhiteSpace(w.Id) || !wsIds.Add(w.Id)) { w.Id = NewId(); wsIds.Add(w.Id); }
+            if (!wsNames.Add(w.Name)) { w.Name += $" ({w.Id[..4]})"; wsNames.Add(w.Name); }
+            if (w.OnFailure is not ("stop" or "continue")) w.OnFailure = "stop";
+            w.MaxParallel = Math.Clamp(w.MaxParallel <= 0 ? 4 : w.MaxParallel, 1, 16);
 
             var resolved = new List<string>();
-            foreach (var member in g.Apps)
+            foreach (var member in w.Apps)
             {
                 var app = Find(member);
-                if (app is null) notes.Add($"Group “{g.Name}”: no app called “{member}”; removed it from the group.");
+                if (app is null) notes.Add($"Workspace “{w.Name}”: no app called “{member}”; removed it.");
                 else if (!resolved.Contains(app.Id)) resolved.Add(app.Id);
             }
-            g.Apps = resolved;
+            w.Apps = resolved;
+
+            // Dependencies: resolve names → ids, keep only members, no self-dependencies.
+            var deps = new Dictionary<string, List<string>>();
+            foreach (var (key, values) in w.DependsOn)
+            {
+                if (Find(key)?.Id is not { } id || !resolved.Contains(id)) continue;
+                var list = (values ?? new()).Select(v => Find(v)?.Id).Where(v => v is not null && v != id && resolved.Contains(v!)).Select(v => v!).Distinct().ToList();
+                if (list.Count > 0) deps[id] = list;
+            }
+            w.DependsOn = deps;
+
+            if (Workspace.WorkspacePlan.FindCycle(w) is { } cycle)
+            {
+                foreach (var id in cycle) w.DependsOn.Remove(id);
+                notes.Add($"Workspace “{w.Name}”: the dependencies between {string.Join(", ", cycle.Select(id => ById(id)?.Name ?? id))} formed a loop, so they were removed.");
+            }
         }
 
         IgnoredPorts = IgnoredPorts.Where(p => p is >= 1 and <= 65535).Distinct().ToList();
         if (Notifications is not ("all" or "crashes" or "off")) Notifications = "all";
+        if (RestoreSession is not ("ask" or "auto" or "off")) RestoreSession = "ask";
         if (PollMs < 500) PollMs = 500;
         Hotkey ??= "";
         return notes;
@@ -269,6 +373,8 @@ public sealed class Registry
         DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingDefault,
         ReadCommentHandling = JsonCommentHandling.Skip,
         AllowTrailingCommas = true,
+        // A local config file meant for humans: write "Ctrl+Alt+L", not "Ctrl+Alt+L".
+        Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
     };
 
     public static string Folder =>
@@ -292,9 +398,24 @@ public sealed class Registry
     /// <summary>
     /// Loads the registry: creates it from apps.example.json on first run, recovers from a corrupt file using the
     /// newest good backup, migrates older schemas and normalizes the data. Problems are listed in LoadWarnings.
+    /// With <paramref name="readOnly"/> (used by the CLI) nothing on disk is created, migrated, backed up or repaired.
     /// </summary>
-    public static Registry Load()
+    public static Registry Load(bool readOnly = false)
     {
+        if (readOnly)
+        {
+            if (!File.Exists(FilePath)) throw new FileNotFoundException($"No registry yet at {FilePath}. Start Localhost Dock once to create it.");
+            string current = File.ReadAllText(FilePath);
+            var ro = Parse(current); // throws JsonException on a corrupt file: never "repair" from the CLI
+            if (ro.SchemaVersion > CurrentSchema)
+                throw new InvalidOperationException($"apps.json was written by a newer Localhost Dock (schema {ro.SchemaVersion}).");
+            ro.LoadWarnings.AddRange(ro.Normalize());
+            ro.SchemaVersion = CurrentSchema;
+            ro._diskHash = Hash(current);
+            ro._readOnly = true;
+            return ro;
+        }
+
         Directory.CreateDirectory(Folder);
         if (!File.Exists(FilePath))
         {
@@ -385,6 +506,7 @@ public sealed class Registry
     /// </summary>
     public void Save()
     {
+        if (_readOnly) throw new InvalidOperationException("This registry was loaded read-only (CLI); it can't be saved.");
         Directory.CreateDirectory(Folder);
         string json = JsonSerializer.Serialize(this, Json);
         if (File.Exists(FilePath))

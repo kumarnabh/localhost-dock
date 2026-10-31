@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- The engine: registry, detection, process identity/guard, launching, health, workspaces.
+       No UI. Shared by the tray app (LocalhostDock), the CLI (ldock) and the tests. -->
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>LocalhostDock</RootNamespace>
+    <AssemblyName>LocalhostDock.Core</AssemblyName>
+    <Version>0.4.0</Version>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="LocalhostDock" />
+    <InternalsVisibleTo Include="ldock" />
+    <InternalsVisibleTo Include="LocalhostDock.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.Management" Version="10.0.0" />
+  </ItemGroup>
+
+</Project>

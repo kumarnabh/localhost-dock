@@ -69,7 +69,7 @@ internal static class Theme
     {
         AppState.Up => Up,
         AppState.Down => Down,
-        AppState.Starting or AppState.Stopping or AppState.Conflict => Pending,
+        AppState.Starting or AppState.Stopping or AppState.Conflict or AppState.Degraded => Pending,
         _ => Unknown,
     };
 
@@ -232,10 +232,10 @@ internal sealed class FlatButton : Button
         Cursor = Cursors.Hand;
         Margin = new Padding(Theme.S(2), 0, 0, 0);
         Padding = Padding.Empty;
-        SetStyle(ControlStyles.Selectable, false);
+        // Must stay selectable: WinForms' PerformClick (used by keyboard, screen readers and UI Automation's
+        // Invoke) silently does nothing for a non-selectable button. Focus cues follow Windows' own rule
+        // (shown once the keyboard is used), so mouse users don't see focus rectangles.
     }
-
-    protected override bool ShowFocusCues => false;
 
     protected override void OnEnabledChanged(EventArgs e)
     {

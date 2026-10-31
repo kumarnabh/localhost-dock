@@ -8,7 +8,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>LocalhostDock</AssemblyName>
     <RootNamespace>LocalhostDock</RootNamespace>
-    <Version>0.3.0</Version>
+    <Version>0.4.0</Version>
     <Product>Localhost Dock</Product>
     <Description>A tray widget for every local app and dev server you run.</Description>
     <!-- SystemAware: layout is scaled once by Theme.S(); Windows scales the whole window on monitors with a different DPI. -->
@@ -21,7 +21,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="System.Management" Version="10.0.0" />
+    <ProjectReference Include="..\LocalhostDock.Core\LocalhostDock.Core.csproj" />
   </ItemGroup>
 
   <ItemGroup>

@@ -85,6 +85,7 @@ internal abstract class HoverRow : Panel, IFilterable
 internal sealed class AppRow : HoverRow
 {
     private readonly Button _open, _start, _stop, _restart;
+    private bool _conflict;
 
     public AppEntry App { get; }
 
@@ -93,7 +94,7 @@ internal sealed class AppRow : HoverRow
         IconButton(IconPlay, "Start", (_, _) => dock.Act(app, "start")),
         IconButton(IconStop, "Stop", (_, _) => dock.Act(app, "stop"), danger: true),
         IconButton(IconRestart, "Restart", (_, _) => dock.Act(app, "restart")),
-        IconButton(IconMore, "More: logs, folder, VS Code, groups, edit…", (_, _) => { }))
+        IconButton(IconMore, "More: logs, folder, VS Code, workspaces, edit…", (_, _) => { }))
     {
     }
 
@@ -106,6 +107,9 @@ internal sealed class AppRow : HoverRow
         more.Click += (_, _) => dock.ShowAppMenu(app, more, new Point(0, more.Height));
         OnBodyClick((s, e) => { if (e.Button == MouseButtons.Right) dock.ShowAppMenu(app, (Control)s!, e.Location); });
         OnBodyDoubleClick((_, _) => dock.Act(app, App.EffectiveUrl is not null ? "open" : "start"));
+        // Clicking a conflict explanation opens the wizard that resolves it.
+        SubLabel.Cursor = Cursors.Hand;
+        SubLabel.Click += (_, _) => { if (_conflict) dock.ResolveConflict(app); };
         Tips.SetToolTip(TitleLabel, Describe(app));
     }
 
@@ -123,32 +127,37 @@ internal sealed class AppRow : HoverRow
         string state = s.State switch
         {
             AppState.Up => (s.UpSince is { } since ? $"up {Ago(DateTime.Now - since)}" : "up") +
+                           (s.Health is { Last: not null } h ? $" · {h.Describe()}" : "") +
                            (s.PrimaryOwnership == Ownership.Unverified ? " (owner unverified)" : ""),
+            AppState.Degraded => $"degraded · {s.Health?.Describe() ?? "health check failing"}",
             AppState.Down when s.LastError is { } err => "failed: " + err,
             AppState.Down when s.LastExit is { Expected: false } ex => ex.Code is int code ? $"crashed (exit code {code})" : "went down unexpectedly",
             AppState.Down => "down",
-            AppState.Starting => "starting…",
+            AppState.Starting => s.Health is { Last: { Ok: false } } ? $"starting… waiting for health ({s.Health.Describe()})" : "starting…",
             AppState.Stopping => "stopping…",
-            AppState.Conflict => $"port held by {s.ForeignHolder?.Identity?.ToString() ?? "another program"}",
+            AppState.Conflict => $"port held by {s.ForeignHolder?.Identity?.ToString() ?? "another program"} · click to resolve",
             _ => "no port set; ⋯ → Edit to finish setup",
         };
         if (app.StartUnverified && s.State != AppState.Up) state += " · start command unverified";
-        string mem = s.State == AppState.Up && s.MemoryBytes > 0 ? $" · {Bytes(s.MemoryBytes)}" : "";
+        string mem = s.State is AppState.Up or AppState.Degraded && s.MemoryBytes > 0 ? $" · {Bytes(s.MemoryBytes)}" : "";
         string text = ports.Length > 0 ? $"{ports} · {state}{mem}" : state;
         if (SubLabel.Text != text)
         {
             SubLabel.Text = text;
-            SubLabel.ForeColor = s.State == AppState.Conflict || (s.State == AppState.Down && (s.LastError is not null || s.LastExit is { Expected: false }))
+            SubLabel.ForeColor = s.State is AppState.Conflict or AppState.Degraded || (s.State == AppState.Down && (s.LastError is not null || s.LastExit is { Expected: false }))
                 ? Pending : Muted;
             Tips.SetToolTip(SubLabel, StatusExplanation(s) + "\n" + text);
         }
 
-        bool up = s.State == AppState.Up;
+        _conflict = s.State == AppState.Conflict;
+        bool up = s.State is AppState.Up or AppState.Degraded;
         bool busy = s.State is AppState.Starting or AppState.Stopping;
         bool hasStart = !string.IsNullOrWhiteSpace(app.Start);
         _open.Enabled = app.EffectiveUrl is not null;
-        _start.Enabled = hasStart && !busy && s.State is AppState.Down or AppState.NotConfigured;
-        _stop.Enabled = (up || s.Listeners.Count > 0) && s.State != AppState.Stopping;
+        _start.Enabled = hasStart && !busy && s.State is AppState.Down or AppState.NotConfigured or AppState.Conflict;
+        // Only offer Stop when something of *this app's* is running, or its port is in conflict (Stop then asks first).
+        // A stranger on an extra port while the app is down is not a reason to light up Stop.
+        _stop.Enabled = (up || s.State == AppState.Conflict || s.Listeners.Any(l => l.Ownership != Ownership.Foreign)) && s.State != AppState.Stopping;
         _restart.Enabled = hasStart && up && !busy;
         Theme.Tips.SetToolTip(_stop, s.State == AppState.Conflict
             ? "Stop: the process on this port isn't verified as this app, so you'll be asked first"
@@ -157,10 +166,12 @@ internal sealed class AppRow : HoverRow
 
     private static string StatusExplanation(AppStatus s) => s.State switch
     {
-        AppState.Up when s.PrimaryOwnership == Ownership.Owned => "Running: started by Localhost Dock.",
+        AppState.Up when s.Health is { Last: { Ok: true } } && s.LastStartDuration is { } took => $"Running and healthy; it was ready {took.TotalSeconds:0.0} s after Start.",
+        AppState.Degraded => $"Listening, but the health check ({s.App.Health}) is failing: {s.Health?.Describe()}. Availability over the last {s.Health?.Samples} checks: {s.Health?.Availability:P0}.",
+        AppState.Up when s.PrimaryOwnership == Ownership.Owned => "Running: started by Localhost Dock." + (s.LastStartDuration is { } t ? $" Ready after {t.TotalSeconds:0.0} s." : ""),
         AppState.Up when s.PrimaryOwnership == Ownership.Matched => "Running: the process on the port belongs to this app's folder.",
         AppState.Up => "Something is listening on the port, but Localhost Dock can't verify it's this app. Stop will ask before closing it.",
-        AppState.Conflict => $"Another program holds this app's port ({s.ForeignHolder?.Evidence}). Start is blocked until the port is free.",
+        AppState.Conflict => $"Another program holds this app's port ({s.ForeignHolder?.Evidence}). Click to see who it is and to free the port or move this app.",
         AppState.Down when s.LastExit is { Expected: false } ex => $"It went down without you stopping it ({ex.Process}{(ex.Code is int c ? $", exit code {c}" : "")}).",
         AppState.Down => "Not running.",
         AppState.Starting => "Waiting for the app to listen on its port.",
@@ -176,45 +187,70 @@ internal sealed class AppRow : HoverRow
         }.Where(x => x is not null));
 }
 
-/// <summary>A start group: combined status and Start all / Stop all.</summary>
-internal sealed class GroupRow : HoverRow
+/// <summary>A workspace: readiness of its members and one-click Start all / Stop all (dependency-aware).</summary>
+internal sealed class WorkspaceRow : HoverRow
 {
     private readonly Button _start, _stop;
-    private readonly GroupEntry _group;
+    private readonly WorkspaceEntry _ws;
     private List<string> _memberNames = new();
 
-    public GroupRow(GroupEntry group, DockForm dock) : this(group, dock,
-        IconButton(IconPlay, "Start all (in order)", (_, _) => dock.ActGroup(group, "start")),
-        IconButton(IconStop, "Stop all", (_, _) => dock.ActGroup(group, "stop"), danger: true),
+    public WorkspaceRow(WorkspaceEntry ws, DockForm dock) : this(ws, dock,
+        IconButton(IconPlay, "Start workspace (dependencies first)", (_, _) => dock.ActWorkspace(ws, "start")),
+        IconButton(IconStop, "Stop workspace (dependents first)", (_, _) => dock.ActWorkspace(ws, "stop"), danger: true),
         IconButton(IconMore, "More", (_, _) => { }))
     {
     }
 
-    private GroupRow(GroupEntry group, DockForm dock, Button start, Button stop, Button more) : base(start, stop, more)
+    private WorkspaceRow(WorkspaceEntry ws, DockForm dock, Button start, Button stop, Button more) : base(start, stop, more)
     {
-        _group = group;
+        _ws = ws;
         (_start, _stop) = (start, stop);
-        TitleLabel.Text = group.Name;
-        more.Click += (_, _) => dock.ShowGroupMenu(group, more, new Point(0, more.Height));
-        OnBodyClick((s, e) => { if (e.Button == MouseButtons.Right) dock.ShowGroupMenu(group, (Control)s!, e.Location); });
+        TitleLabel.Text = ws.Name;
+        more.Click += (_, _) => dock.ShowWorkspaceMenu(ws, more, new Point(0, more.Height));
+        OnBodyClick((s, e) => { if (e.Button == MouseButtons.Right) dock.ShowWorkspaceMenu(ws, (Control)s!, e.Location); });
+        OnBodyDoubleClick((_, _) => dock.ActWorkspace(ws, "start"));
     }
 
     public override bool Matches(string q) =>
-        _group.Name.Contains(q, StringComparison.OrdinalIgnoreCase) || _memberNames.Any(a => a.Contains(q, StringComparison.OrdinalIgnoreCase));
+        _ws.Name.Contains(q, StringComparison.OrdinalIgnoreCase) || _memberNames.Any(a => a.Contains(q, StringComparison.OrdinalIgnoreCase));
 
-    public void Update(GroupStatus g)
+    public void Update(WorkspaceStatus w)
     {
-        int total = g.Members.Count, up = g.Up;
-        DotControl.Color = g.Busy ? Pending : up == 0 ? Down : Up;
-        DotControl.Ring = up > 0 && up < total && !g.Busy;
-        _memberNames = g.Members.Select(m => m.App.Name).ToList();
-        string text = $"{up} of {total} up · {string.Join(", ", _memberNames)}" + (g.Group.OnFailure == "continue" ? " · continues past failures" : "");
-        if (SubLabel.Text != text) SubLabel.Text = text;
-        _start.Enabled = up < total && !g.Busy;
-        _stop.Enabled = up > 0 && !g.Busy;
+        int total = w.Members.Count, ready = w.Up;
+        bool trouble = w.Members.Any(m => m.State is AppState.Conflict or AppState.Degraded || m.LastError is not null);
+        DotControl.Color = w.Busy ? Pending : ready == 0 ? (trouble ? Pending : Down) : trouble ? Pending : Up;
+        DotControl.Ring = ready > 0 && ready < total && !w.Busy;
+        _memberNames = w.Members.Select(m => m.App.Name).ToList();
+        // e.g. "2 of 3 ready · API ✓ · Web ✓ · Worker ✗"
+        string marks = string.Join(" · ", w.Members.Select(m => m.App.Name + (m.State switch
+        {
+            AppState.Up => " ✓",
+            AppState.Starting or AppState.Stopping => " …",
+            AppState.Degraded => " ⚠",
+            AppState.Conflict => " ⚠",
+            _ => " ✗",
+        })));
+        string text = $"{ready} of {total} ready · {marks}";
+        if (SubLabel.Text != text)
+        {
+            SubLabel.Text = text;
+            Tips.SetToolTip(SubLabel, "Start order: " + StartOrder(w) + (w.Workspace.OnFailure == "continue" ? "\nKeeps starting what doesn't depend on a failed app." : "\nStops starting more as soon as one fails."));
+        }
+        _start.Enabled = ready < total && !w.Busy;
+        _stop.Enabled = w.Members.Any(m => m.State is AppState.Up or AppState.Degraded) && !w.Busy;
+    }
+
+    private static string StartOrder(WorkspaceStatus w)
+    {
+        try
+        {
+            var names = w.Members.ToDictionary(m => m.App.Id, m => m.App.Name);
+            return string.Join(" → ", LocalhostDock.Workspace.WorkspacePlan.Levels(w.Workspace)
+                .Select(level => string.Join(" + ", level.Select(id => names.GetValueOrDefault(id, id)))));
+        }
+        catch (InvalidOperationException ex) { return ex.Message; }
     }
 }
-
 /// <summary>A listening port that isn't in the registry.</summary>
 internal sealed class DiscoveredRow : HoverRow
 {

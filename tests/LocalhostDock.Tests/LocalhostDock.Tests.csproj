@@ -17,6 +17,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\LocalhostDock\LocalhostDock.csproj" />
+    <ProjectReference Include="..\..\src\LocalhostDock.Core\LocalhostDock.Core.csproj" />
   </ItemGroup>
 
 </Project>

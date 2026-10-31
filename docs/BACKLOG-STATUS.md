@@ -1,7 +1,8 @@
 # Upgrade backlog: status
 
-Status of the 110-item upgrade backlog (audited against `afa0912`) as of **v0.3.0**. Batch 1 prioritized the
-backlog's own rule: *P0 safety and correctness before new product functionality*.
+Status of the 110-item upgrade backlog (audited against `afa0912`) as of **v0.4.0**.
+- **Batch 1 (v0.3.0)** followed the backlog's own rule, *P0 safety and correctness before new product functionality*.
+- **Batch 2 (v0.4.0)** added workspaces, health/readiness, the port-conflict wizard, session restore, more framework detection and the `ldock` CLI.
 
 **Legend:** ✅ done (with tests where testable) · 🟡 partly done (what's missing is stated) · ⬜ not started
 
@@ -50,7 +51,7 @@ backlog's own rule: *P0 safety and correctness before new product functionality*
 | 29 | Graceful before forceful termination | 🟡 | Close-window + Ctrl+C to the app's console, then force after `gracefulTimeoutSec`. Ctrl+C delivery can't be exercised from the test host (it has its own console); verified only through the force path and policy tests |
 | 30 | Stop policies (never force-kill) | ✅ | `stopPolicy`: `graceful` / `graceful-only` / `force`. Test: `Graceful_only_policy_never_force_kills` |
 | 31 | Exit codes, startup exceptions, failure reasons | ✅ | Launcher exit codes, start exceptions and timeouts become `lastError`; crashes record the process and exit code |
-| 32 | Per-app timeouts | 🟡 | `startTimeoutSec`, `gracefulTimeoutSec`. Health-check timeouts await item 44 |
+| 32 | Per-app timeouts | ✅ | `startTimeoutSec`, `gracefulTimeoutSec`, `healthIntervalSec`, `healthTimeoutMs` |
 | 33 | Detached children / ancestry changes | 🟡 | Ownership falls back from the launch tree to working-directory/command-line evidence when a launcher detaches. No continuous ancestry-change monitoring |
 | 34 | WMI / restricted processes / inaccessible ports | ✅ | WMI timeout + exception handling; restricted processes get a plain explanation instead of failing |
 | 35 | Async App Editor detection | ✅ | Runs on a worker thread; stale results are discarded |
@@ -60,47 +61,76 @@ backlog's own rule: *P0 safety and correctness before new product functionality*
 | 39 | Incremental discovery rows | ⬜ | |
 | 40 | Explain permission failures | 🟡 | Access-denied and protected-process messages; not yet a dedicated "why" panel |
 
-## D. Intelligent workspace management: ⬜ not started (batch 2)
+## D. Intelligent workspace management
 
-41 Workspace profiles · 42 One-click workspace start/stop/restore · 43 Dependency graphs (ordered groups with failure policies exist today) · 44 HTTP health/readiness checks · 45 Port-conflict wizard (conflicts are detected and explained; no wizard) · 46 More framework discovery (Next/Vite/Astro/Angular/Django/… from v0.2; FastAPI/Flask/ASP.NET/Spring not yet) · 47 Docker/Compose · 48 WSL · 49 Templates · 50 Session restore
+| # | Item | Status | Notes / acceptance evidence |
+|---|---|---|---|
+| 41 | Workspace profiles | ✅ | Named workspaces with members, dependencies, failure policy and parallelism; editor with live start order. Schema v3, v2 groups migrated as dependency chains. Test: `Migrates_v2_groups_to_workspace_chains…` |
+| 42 | One-click workspace start/stop + session restore | ✅ | Workspace row and tray menu Start/Stop; session restore (ask / auto / off) |
+| 43 | Dependency-aware startup/shutdown graphs | ✅ | Members start as soon as their dependencies are *ready*, in parallel up to `maxParallel`; dependents of a failed member never start; stop is dependents-first. Tests: `Independent_members_start_in_parallel…`, `Levels_start_dependencies_first…`, `Cycles_are_found_and_removed_on_load`, `Group_start_stops_at_a_failed_dependency…` |
+| 44 | HTTP health & readiness checks | ✅ | `health` path/URL, interval, timeout; readiness = listening + healthy; degraded state. Local-only (loopback) by design. Tests: `HealthTests` (8) |
+| 45 | Port-conflict resolution wizard | ✅ | Names the holder (process, folder, command line, or the other registered app). Stop it through `ProcessGuard`, stop the owning app, or move this app to a suggested free port (not listening, not reserved by Windows, not registered, not privileged/ephemeral), rewriting explicit `--port`/`-p`/`PORT=` in the start command. Buttons ignore clicks for 0.6 s after appearing. Tests: `PortAdvisorTests` (9), `Conflict_wizard_renders_and_fits` |
+| 46 | More framework discovery | ✅ | + FastAPI (uvicorn, venv-aware), Flask, ASP.NET Core (launchSettings), Spring Boot (Maven/Gradle wrappers, server.port), Rails, Laravel; Next/Vite/Astro/Angular/Django from earlier. Tests: `FrameworkDetectionTests` |
+| 47 | Docker / Compose | ⬜ | |
+| 48 | WSL | ⬜ | |
+| 49 | Workspace templates | ⬜ | |
+| 50 | Restore sessions after reboot/crash | ✅ | Only apps that were running, are down now and have a start command; never stops anything; keeps workspace dependencies; unverified commands unticked (skipped in auto). The previous session is held until you answer. Test: `Session_is_saved_and_only_down_apps…` |
 
 ## E. Monitoring & observability
 
 | # | Status | Notes |
 |---|---|---|
-| 51 | 🟡 | Memory and uptime per app (verified processes only); no CPU or per-tree breakdown |
-| 52 | 🟡 | States: up, down, starting, stopping, conflict, crashed (exit code), failed (reason); no history |
-| 53 | ✅ | Crash detection by process identity with exit code; user stops aren't crashes. Tests: `Crash_is_detected_with_exit_code_and_identity`, `User_stop_is_not_reported_as_a_crash` |
-| 54–61 | ⬜ | Auto-restart with back-off, log search/filters, merged timeline, latency, thresholds, history, startup profiling, diagnostic reports |
+| 51 | 🟡 | Memory and uptime per app; no CPU or per-tree breakdown |
+| 52 | 🟡 | States: up, degraded, down, crashed (exit code), failed (reason), conflict, starting, stopping; no persisted history |
+| 53 | ✅ | Crash detection by process identity with exit code (v0.3) |
+| 54 | ⬜ | Auto-restart with back-off |
+| 55, 56 | ⬜ | Log search/filters, merged timeline |
+| 57 | ✅ | Health latency and availability per app (row, tooltip, CLI) |
+| 58 | ⬜ | |
+| 59 | 🟡 | Bounded health history (120 samples per app); no CPU/memory history |
+| 60 | ✅ | Time-to-ready measured per start; a workspace start reports its slowest member. Test: `StartAndWait_waits_for_health…` |
+| 61 | 🟡 | `ldock status` / `who` / `manifest` give a redacted snapshot; no one-click diagnostic report yet |
 
 ## F. Developer productivity
 
 | # | Status | Notes |
 |---|---|---|
+| 63 | ✅ | `openOnReady`: opens the URL once a dock Start becomes ready (healthy if a check is configured) |
 | 64 | 🟡 | Windows Terminal / cmd; not configurable |
 | 65 | 🟡 | VS Code; not configurable |
+| 70 | 🟡 | Secret redaction for command lines in CLI output; no environment-variable inspector |
 | 71 | 🟡 | Automatic backups and corruption restore; no import/export UI |
 | 72 | 🟡 | Duplicate detection by start command + working directory or folder + port |
-| 75 | 🟡 | Group order and failure policy; no concurrency setting |
-| 62, 63, 66–70, 73, 74 | ⬜ | |
+| 75 | ✅ | Workspace start order (dependencies), concurrency (`maxParallel`) and failure handling (`onFailure`) |
+| 62, 66–69, 73, 74 | ⬜ | |
 
 ## G. Desktop UI & accessibility
 
 | # | Status | Notes |
 |---|---|---|
 | 77 | 🟡 | Panel sizes to content and screen; no responsive layout modes |
-| 78 | ⬜ | Deliberately *system*-DPI aware: Windows scales the panel uniformly on other monitors (correct but slightly soft there). True per-monitor V2 needs a layout pass on `DpiChanged` |
-| 80 | 🟡 | Icon buttons carry accessible names; keyboard search/Enter/Esc/Ctrl+N; no full tab navigation or focus visuals |
-| 81 | 🟡 | Status explanations in row tooltips; onboarding empty state |
-| 76, 79, 82–85 | ⬜ | |
+| 78 | ⬜ | Deliberately *system*-DPI aware (uniform scaling on other monitors) |
+| 80 | 🟡 | **Fixed in v0.4:** dock buttons couldn't be activated by keyboard, screen readers or UI Automation (they were non-selectable, so `PerformClick` did nothing). Accessible names on icon buttons; no full tab navigation design yet |
+| 81 | 🟡 | Status explanations in row tooltips (now with health and time-to-ready); onboarding empty state |
+| 84 | 🟡 | Live start-order text in the workspace editor and row tooltip; per-member readiness marks; no graphical graph |
+| 76, 79, 82, 83, 85 | ⬜ | |
 
-## H. AI agent integration: ⬜ not started (86–93)
+## H. AI agent integration
 
+| # | Status | Notes |
+|---|---|---|
+| 86 | ✅ | `ldock status / who / workspaces / manifest`, `--json`, exit codes. Read-only. Tests: `CliTests` |
+| 87 | ✅ | `localhost-dock/manifest@1`: app ids, commands (redacted), cwd, ports, health, stop policy, workspace dependencies and computed start order. Documented in docs/CLI.md |
+| 88 | ⬜ | MCP interface (the CLI is its read-only foundation) |
+| 89 | ⬜ | Agent-triggered Start/Stop (deliberately not in the CLI) |
+| 90 | 🟡 | Redacted status/manifest/who output; no bundled report with logs |
+| 91, 92 | ⬜ | |
+| 93 | 🟡 | Today's policy is simple: agents get read-only access only |
 ## I. Architecture, security & release
 
 | # | Status | Notes |
 |---|---|---|
-| 94 | 🟡 | New services: `ProcessGuard`, `ProcessIdentity`/`ProcessTree`, `ProcessCwd`, `Launcher`, `Registry`. Runtime state and execution still live together in `AppController` |
+| 94 | 🟡 | Engine split into `LocalhostDock.Core` (shared by the app, the CLI and the tests) with `ProcessGuard`, `ProcessIdentity`, `Launcher`, `Registry`, `HealthMonitor`, `WorkspacePlan`, `SessionStore`, `PortAdvisor`, `CliRunner`. Runtime state and execution still live together in `AppController` |
 | 95 | ✅ | Immutable app and group ids; `schemaVersion: 2` |
 | 96 | ✅ | `ProcessIdentity` + ownership classification |
 | 97 | ✅ | `ProcessGuard` for every termination |
@@ -113,7 +143,7 @@ backlog's own rule: *P0 safety and correctness before new product functionality*
 | 104 | 🟡 | Safe staged installer with rollback; no winget package or update check |
 | 105 | ✅ | Self-contained single-file release zip alongside the framework-dependent one |
 | 106 | 🟡 | CI: dependency vulnerability gate, coverage collected and uploaded; no static-analysis gate yet |
-| 107 | ⬜ | UI checked manually with window-only screenshots; no automated UI tests |
+| 107 | 🟡 | `UiSmokeTests` render the workspace editor, app editor, conflict wizard and restore dialog **off-screen** and fail on collapsed/overflowing controls (caught a real overflow in v0.4). No tray/context-menu/multi-monitor automation yet |
 | 108 | ✅ | `SafetyTests` (15 tests) plus discovery/protection tests in `CoreTests` |
 | 109 | 🟡 | Crash, PID reuse, port takeover, simultaneous actions, file corruption: tested. Upgrade rollback: not automated |
 | 110 | 🟡 | Release gate: CI must pass build, vulnerability scan, all tests (incl. safety) and both builds' `--selftest` before a release is published. Windows 10 matrix, performance and accessibility gates not yet |

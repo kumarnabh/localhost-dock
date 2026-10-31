@@ -3,13 +3,16 @@
   // You rarely need to edit this by hand: drop a launcher or project folder on the dock, or use
   // "+ Add → Scan a folder for apps". Comments and trailing commas are allowed.
   // See docs/CONFIGURATION.md for every field.
+  "schemaVersion": 3,
   "apps": [
     {
       // Reuse an existing launcher: point "start" (and optionally "stop") at your .cmd files.
       "name": "My API",
       "port": 8765,
       "start": "C:\\dev\\my-api\\Start-API.cmd",
-      "stop": "C:\\dev\\my-api\\Stop-API.cmd"
+      "stop": "C:\\dev\\my-api\\Stop-API.cmd",
+      // Ready = healthy, not just listening (checked on http://localhost:8765/healthz).
+      "health": "/healthz"
     },
     {
       // Or any command line, run in "cwd". captureLogs records its output for "View logs".
@@ -17,7 +20,8 @@
       "port": 5280,
       "start": "npm run dev",
       "cwd": "C:\\dev\\my-web",
-      "captureLogs": true
+      "captureLogs": true,
+      "openOnReady": true
     },
     {
       // An app that uses two ports: the dot follows "port", Stop frees both.
@@ -28,12 +32,13 @@
       "start": "C:\\dev\\fullstack\\start.bat"
     }
   ],
-  // Start several apps with one click, in order; stopped in reverse.
-  "groups": [
-    { "name": "Everything", "apps": ["My API", "Web"] }
+  // A workspace starts its apps dependencies-first: here Web waits until My API is healthy.
+  "workspaces": [
+    { "name": "Everything", "apps": ["My API", "Web"], "dependsOn": { "Web": ["My API"] } }
   ],
   "ignoredPorts": [],
   "pollMs": 2000,
   "hotkey": "Ctrl+Alt+L",
-  "notifications": "all"
+  "notifications": "all",
+  "restoreSession": "ask"
 }

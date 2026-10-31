@@ -10,7 +10,16 @@ You need Windows 10/11, the [.NET 10 SDK](https://dotnet.microsoft.com/download/
 dotnet build
 dotnet test
 dotnet run --project src/LocalhostDock -- --show   # --show opens the dock immediately
+dotnet run --project src/ldock -- status            # the read-only CLI
 ```
+
+Projects:
+- `src/LocalhostDock.Core`: the engine. It has no UI and is where most changes and tests belong.
+- `src/LocalhostDock`: the tray app.
+- `src/ldock`: the CLI host.
+- `tests/LocalhostDock.Tests`: the tests.
+
+UI tests must never show windows where you could click them; render off-screen like `UiSmokeTests`.
 
 To try changes without touching your real registry, point the app at a scratch folder:
 

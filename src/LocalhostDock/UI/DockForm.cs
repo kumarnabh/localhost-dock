@@ -6,7 +6,7 @@ using static LocalhostDock.UI.Theme;
 
 namespace LocalhostDock.UI;
 
-/// <summary>The popup panel: search, groups, apps, discovered ports, and the port lookup.</summary>
+/// <summary>The popup panel: search, workspaces, apps, discovered ports, and the port lookup.</summary>
 internal sealed class DockForm : Form
 {
     public static readonly int PanelWidth = S(500);
@@ -23,7 +23,7 @@ internal sealed class DockForm : Form
     private readonly Button _addButton;
 
     private readonly Dictionary<string, AppRow> _rows = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Dictionary<string, GroupRow> _groupRows = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, WorkspaceRow> _workspaceRows = new(StringComparer.OrdinalIgnoreCase);
     private string _signature = "";
     private Snapshot? _last;
     private DateTime _hiddenAt;
@@ -198,7 +198,7 @@ internal sealed class DockForm : Form
         _summary.Text = $"{tracked.Count(a => a.State == AppState.Up)} of {tracked.Count} up" +
                         (snap.Discovered.Count > 0 ? $"  ·  {snap.Discovered.Count} unknown port{(snap.Discovered.Count == 1 ? "" : "s")}" : "");
 
-        string sig = string.Join("|", snap.Groups.Select(g => g.Group.Id + g.Group.Name + ":" + string.Join(",", g.Group.Apps))) + "#" +
+        string sig = string.Join("|", snap.Workspaces.Select(w => w.Workspace.Id + w.Workspace.Name + ":" + string.Join(",", w.Workspace.Apps) + ":" + w.Workspace.DependsOn.Count + w.Workspace.OnFailure)) + "#" +
                      string.Join("|", snap.Apps.Select(a => a.App.Id + "=" + a.App.Name + (a.App.StartUnverified ? "?" : ""))) + "#" +
                      string.Join("|", snap.Discovered.Select(d => $"{d.Port}/{d.Pid}"));
         if (sig != _signature)
@@ -208,8 +208,8 @@ internal sealed class DockForm : Form
         }
         foreach (var s in snap.Apps)
             if (_rows.TryGetValue(s.App.Id, out var row)) row.Update(s);
-        foreach (var g in snap.Groups)
-            if (_groupRows.TryGetValue(g.Group.Id, out var row)) row.Update(g);
+        foreach (var w in snap.Workspaces)
+            if (_workspaceRows.TryGetValue(w.Workspace.Id, out var row)) row.Update(w);
     }
 
     private void Rebuild(Snapshot snap)
@@ -219,15 +219,15 @@ internal sealed class DockForm : Form
         _list.Controls.Clear();
         foreach (var c in old) c.Dispose();
         _rows.Clear();
-        _groupRows.Clear();
+        _workspaceRows.Clear();
 
-        if (snap.Groups.Count > 0)
+        if (snap.Workspaces.Count > 0)
         {
-            _list.Controls.Add(SectionLabel("GROUPS", snap.Groups.Count));
-            foreach (var g in snap.Groups)
+            _list.Controls.Add(SectionLabel("WORKSPACES", snap.Workspaces.Count));
+            foreach (var w in snap.Workspaces)
             {
-                var row = new GroupRow(g.Group, this);
-                _groupRows[g.Group.Id] = row;
+                var row = new WorkspaceRow(w.Workspace, this);
+                _workspaceRows[w.Workspace.Id] = row;
                 _list.Controls.Add(row);
             }
         }
@@ -319,7 +319,7 @@ internal sealed class DockForm : Form
         menu.Items.Add(DarkMenu.Item("Add from a launcher or project folder…", PickAndAdd));
         menu.Items.Add(DarkMenu.Item("Scan a folder for apps…", () => ScanFolder()));
         menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add(DarkMenu.Item("New group…", () => EditGroup(null)));
+        menu.Items.Add(DarkMenu.Item("New workspace…", () => EditWorkspace(null)));
         menu.Show(_addButton, new Point(0, _addButton.Height));
     }
 
@@ -472,6 +472,11 @@ internal sealed class DockForm : Form
             result = OperationResult.Fail(ex.Message);
         }
         _requestPoll();
+        if (result is { Ok: false } && action is "start" or "restart" && result.Message.StartsWith("Port :"))
+        {
+            ResolveConflict(app); // someone else holds the port: offer the ways out instead of just an error
+            return;
+        }
         if (result is { Ok: false })
             ShowModal(() => MessageBox.Show(this, result.Message, $"{app.Name}: {action}", MessageBoxButtons.OK, MessageBoxIcon.Warning));
     }
@@ -504,6 +509,12 @@ internal sealed class DockForm : Form
         var reg = _controller.Registry;
         var menu = DarkMenu.Create();
         string? folder = app.Folder;
+        if (app.Port is int conflictPort && PortTable.GetListeners().Any(l => l.Port == conflictPort) &&
+            !PortTable.GetListeners().Where(l => l.Port == conflictPort).Select(l => _controller.Classify(app, l)).Any(o => o.Ownership != Ownership.Foreign))
+        {
+            menu.Items.Add(DarkMenu.Item($"Resolve port conflict on :{conflictPort}…", () => ResolveConflict(app)));
+            menu.Items.Add(new ToolStripSeparator());
+        }
         menu.Items.Add(DarkMenu.Item("View logs", () => LogViewer.ShowFor(app)));
         menu.Items.Add(DarkMenu.Item("Copy URL", () => Clipboard.SetText(app.EffectiveUrl!), app.EffectiveUrl is not null));
         menu.Items.Add(DarkMenu.Item("Open folder", () => Process.Start("explorer.exe", $"\"{folder}\""), folder is not null));
@@ -511,23 +522,23 @@ internal sealed class DockForm : Form
         menu.Items.Add(DarkMenu.Item("Open terminal here", () => Shell.OpenTerminal(folder!), folder is not null));
         menu.Items.Add(new ToolStripSeparator());
 
-        var groups = new ToolStripMenuItem("Add to group");
-        List<GroupEntry> groupList;
+        var groups = new ToolStripMenuItem("Add to workspace");
+        List<WorkspaceEntry> groupList;
         int index, count;
         lock (reg.SyncRoot)
         {
-            groupList = reg.Groups.ToList();
+            groupList = reg.Workspaces.ToList();
             index = reg.Apps.FindIndex(a => a.Id == app.Id);
             count = reg.Apps.Count;
         }
         foreach (var g in groupList)
         {
-            var gi = DarkMenu.Item(g.Name, () => ToggleGroupMember(g.Id, app.Id));
+            var gi = DarkMenu.Item(g.Name, () => ToggleWorkspaceMember(g.Id, app.Id));
             gi.Checked = g.Apps.Contains(app.Id);
             groups.DropDownItems.Add(gi);
         }
         if (groupList.Count > 0) groups.DropDownItems.Add(new ToolStripSeparator());
-        groups.DropDownItems.Add(DarkMenu.Item("New group…", () => EditGroup(null, app.Id)));
+        groups.DropDownItems.Add(DarkMenu.Item("New workspace…", () => EditWorkspace(null, app.Id)));
         menu.Items.Add(groups);
 
         menu.Items.Add(DarkMenu.Item("Move up", () => MoveApp(app.Id, -1), index > 0));
@@ -546,7 +557,7 @@ internal sealed class DockForm : Form
         var copy = app.Clone();
         using var editor = new AppEditor(copy, _controller.Registry, $"Edit {app.Name}");
         if (ShowModal(() => editor.ShowDialog(OwnerOrNull())) != DialogResult.OK) return;
-        // Groups refer to apps by Id, so renaming needs no follow-up.
+        // Workspaces refer to apps by Id, so renaming needs no follow-up.
         _controller.Mutate(r => r.Replace(copy));
         SaveAndRefresh();
     }
@@ -580,47 +591,41 @@ internal sealed class DockForm : Form
         SaveAndRefresh();
     }
 
-    // ================================================================ groups
+    // ================================================================ workspaces
 
-    internal async void ActGroup(GroupEntry group, string action)
+    internal async void ActWorkspace(WorkspaceEntry ws, string action)
     {
         OperationResult result;
         try
         {
             result = action == "start"
-                ? await _controller.StartGroupAsync(group, _ => _requestPoll())
-                : await _controller.StopGroupAsync(group, ConfirmForeignStop);
+                ? await _controller.StartWorkspaceAsync(ws, _ => _requestPoll())
+                : await _controller.StopWorkspaceAsync(ws, ConfirmForeignStop);
         }
         catch (Exception ex)
         {
             result = OperationResult.Fail(ex.Message);
         }
         _requestPoll();
-        if (!result.Ok) OperationFinished?.Invoke(group.Name, result.Message, false);
+        // Successful starts report readiness timing (slowest member); failures say what didn't start and why.
+        if (!result.Ok || action == "start") OperationFinished?.Invoke(ws.Name, result.Message, result.Ok);
     }
 
-    internal void ShowGroupMenu(GroupEntry group, Control anchor, Point at)
+    internal void ShowWorkspaceMenu(WorkspaceEntry ws, Control anchor, Point at)
     {
         var menu = DarkMenu.Create();
         menu.Items.Add(DarkMenu.Item("Open all", () =>
         {
             List<AppEntry> members;
             lock (_controller.Registry.SyncRoot)
-                members = group.Apps.Select(_controller.Registry.ById).Where(a => a?.EffectiveUrl is not null).Select(a => a!.Clone()).ToList();
+                members = ws.Apps.Select(_controller.Registry.ById).Where(a => a?.EffectiveUrl is not null).Select(a => a!.Clone()).ToList();
             foreach (var a in members) _controller.Open(a);
         }));
-        menu.Items.Add(DarkMenu.Item("Edit…", () => EditGroup(group)));
-        var failure = DarkMenu.Item("If a member fails to start: stop", () => SetGroupFailure(group.Id, "stop"));
-        failure.Checked = group.OnFailure != "continue";
-        var cont = DarkMenu.Item("If a member fails to start: continue", () => SetGroupFailure(group.Id, "continue"));
-        cont.Checked = group.OnFailure == "continue";
+        menu.Items.Add(DarkMenu.Item("Edit apps, dependencies and start order…", () => EditWorkspace(ws)));
         menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add(failure);
-        menu.Items.Add(cont);
-        menu.Items.Add(new ToolStripSeparator());
-        menu.Items.Add(DarkMenu.Item("Delete group", () =>
+        menu.Items.Add(DarkMenu.Item("Delete workspace (keeps the apps)", () =>
         {
-            _controller.Mutate(r => r.Groups.RemoveAll(g => g.Id == group.Id));
+            _controller.Mutate(r => r.Workspaces.RemoveAll(w => w.Id == ws.Id));
             SaveAndRefresh();
         }, danger: true));
         _modal++;
@@ -628,46 +633,79 @@ internal sealed class DockForm : Form
         menu.Show(anchor, at);
     }
 
-    private void SetGroupFailure(string groupId, string policy)
-    {
-        _controller.Mutate(r => { if (r.Groups.FirstOrDefault(g => g.Id == groupId) is { } g) g.OnFailure = policy; });
-        SaveAndRefresh();
-    }
-
-    private void EditGroup(GroupEntry? group, string? withAppId = null)
+    private void EditWorkspace(WorkspaceEntry? ws, string? withAppId = null)
     {
         if (_controller.Registry.Apps.Count == 0)
         {
-            ShowModal(() => MessageBox.Show(this, "Add some apps first; a group starts several apps together.", "New group"));
+            ShowModal(() => MessageBox.Show(this, "Add some apps first; a workspace starts several apps together.", "New workspace"));
             return;
         }
-        bool isNew = group is null;
-        var working = new GroupEntry
-        {
-            Id = group?.Id ?? Registry.NewId(),
-            Name = group?.Name ?? "",
-            Apps = group?.Apps.ToList() ?? (withAppId is null ? new() : new() { withAppId }),
-            OnFailure = group?.OnFailure ?? "stop",
-        };
-        using var editor = new GroupEditor(working, _controller.Registry, isNew ? "New group" : $"Edit {working.Name}");
+        bool isNew = ws is null;
+        var working = ws?.Clone() ?? new WorkspaceEntry { Id = Registry.NewId(), Apps = withAppId is null ? new() : new() { withAppId } };
+        using var editor = new WorkspaceEditor(working, _controller.Registry, isNew ? "New workspace" : $"Edit {working.Name}");
         if (ShowModal(() => editor.ShowDialog(OwnerOrNull())) != DialogResult.OK) return;
         _controller.Mutate(r =>
         {
-            int i = r.Groups.FindIndex(g => g.Id == working.Id);
-            if (i >= 0) r.Groups[i] = working;
-            else r.Groups.Add(working);
+            int i = r.Workspaces.FindIndex(w => w.Id == working.Id);
+            if (i >= 0) r.Workspaces[i] = working;
+            else r.Workspaces.Add(working);
         });
         SaveAndRefresh();
     }
 
-    private void ToggleGroupMember(string groupId, string appId)
+    private void ToggleWorkspaceMember(string wsId, string appId)
     {
         _controller.Mutate(r =>
         {
-            if (r.Groups.FirstOrDefault(g => g.Id == groupId) is not { } g) return;
-            if (g.Apps.RemoveAll(id => id == appId) == 0) g.Apps.Add(appId);
+            if (r.WorkspaceById(wsId) is not { } w) return;
+            if (w.Apps.Remove(appId))
+            {
+                w.DependsOn.Remove(appId);
+                foreach (var deps in w.DependsOn.Values) deps.Remove(appId);
+            }
+            else w.Apps.Add(appId); // no dependencies until set in the workspace editor
         });
         SaveAndRefresh();
+    }
+
+    // ================================================================ port conflicts
+
+    /// <summary>Opens the conflict wizard for an app whose port is taken, then carries out the choice.</summary>
+    internal async void ResolveConflict(AppEntry shown)
+    {
+        var app = Live(shown);
+        if (app?.Port is not int port) return;
+        using var wizard = new ConflictWizard(app, port, _controller.Registry, _controller);
+        if (ShowModal(() => wizard.ShowDialog(OwnerOrNull())) != DialogResult.OK) return;
+
+        switch (wizard.Choice)
+        {
+            case ConflictChoice.StopOtherApp when wizard.OtherApp is { } other:
+                var stopped = await _controller.StopAsync(other, ConfirmForeignStop);
+                if (!stopped.Ok) { ShowModal(() => MessageBox.Show(this, stopped.Message, $"Stop {other.Name}", MessageBoxButtons.OK, MessageBoxIcon.Warning)); return; }
+                Act(app, "start");
+                break;
+
+            case ConflictChoice.StopHolder when wizard.Holder is { } holder:
+                var killed = await _controller.KillAsync(holder); // identity revalidated inside the guard
+                if (!killed.Ok) { ShowModal(() => MessageBox.Show(this, killed.Message, "Free the port", MessageBoxButtons.OK, MessageBoxIcon.Warning)); return; }
+                Act(app, "start");
+                break;
+
+            case ConflictChoice.MovePort:
+                _controller.Mutate(r =>
+                {
+                    if (r.ById(app.Id) is not { } live) return;
+                    live.Port = wizard.NewPort;
+                    if (wizard.NewStart is not null) live.Start = wizard.NewStart;
+                    if (wizard.NewUrl is not null) live.Url = wizard.NewUrl;
+                });
+                SaveAndRefresh();
+                OperationFinished?.Invoke(app.Name, $"Moved to :{wizard.NewPort}." +
+                    (wizard.NewStart is null && app.Start is not null ? " Remember to change the port in its launcher/config too." : " Press Start when ready."), true);
+                break;
+        }
+        _requestPoll();
     }
 
     // ================================================================ discovered & lookup

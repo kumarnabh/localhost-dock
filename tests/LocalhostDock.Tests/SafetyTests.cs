@@ -283,10 +283,10 @@ public class SafetyTests
             tp.Listen(port, folder);
             apps.Add(new AppEntry { Id = name, Name = name, Port = port, Cwd = folder, Stop = stop, GracefulTimeoutSec = 1 });
         }
-        var group = new GroupEntry { Id = "g", Name = "All", Apps = { "A", "B", "C" } };
-        using var controller = new AppController(new Registry { Apps = { apps[0], apps[1], apps[2] }, Groups = { group } });
+        var group = WorkspaceEntry.Chain("g", "All", new() { "A", "B", "C" }, "stop"); // C needs B needs A
+        using var controller = new AppController(new Registry { Apps = { apps[0], apps[1], apps[2] }, Workspaces = { group } });
 
-        var r = await controller.StopGroupAsync(group, null);
+        var r = await controller.StopWorkspaceAsync(group, null);
         Assert.True(r.Ok, r.Message);
         var lines = File.ReadAllLines(log).Select(l => l.Trim()).ToArray();
         Assert.Equal(new[] { "begin C", "end C", "begin B", "end B", "begin A", "end A" }, lines);
@@ -305,19 +305,28 @@ public class SafetyTests
 
         var api = new AppEntry { Id = "api", Name = "API", Port = TestProcesses.FreePort(), Start = failing, Window = "hidden", StartTimeoutSec = 10 };
         var webApp = new AppEntry { Id = "web", Name = "Web", Port = TestProcesses.FreePort(), Start = web, Window = "hidden", StartTimeoutSec = 5 };
-        var group = new GroupEntry { Id = "g", Name = "Stack", Apps = { "api", "web" } };
-        using var controller = new AppController(new Registry { Apps = { api, webApp }, Groups = { group } });
+        var group = WorkspaceEntry.Chain("g", "Stack", new() { "api", "web" }, "stop"); // Web needs API
+        using var controller = new AppController(new Registry { Apps = { api, webApp }, Workspaces = { group } });
 
-        var r = await controller.StartGroupAsync(group);
+        var r = await controller.StartWorkspaceAsync(group);
         Assert.False(r.Ok);
         Assert.Contains("stopped at API", r.Message);
         Assert.Contains("exited with code 3", r.Message);
         await Task.Delay(500);
         Assert.False(File.Exists(marker));
 
+        // "continue" never starts an app whose dependency failed…
         group.OnFailure = "continue";
-        var r2 = await controller.StartGroupAsync(group);
-        Assert.False(r2.Ok); // still reports the failure…
-        Assert.True(await TestProcesses.UntilAsync(() => File.Exists(marker), 10)); // …but carried on to Web
+        var r2 = await controller.StartWorkspaceAsync(group);
+        Assert.False(r2.Ok);
+        Assert.Contains("Not started (a dependency failed): Web", r2.Message);
+        await Task.Delay(500);
+        Assert.False(File.Exists(marker));
+
+        // …but does start members that don't depend on the failed one.
+        group.DependsOn.Clear();
+        var r3 = await controller.StartWorkspaceAsync(group);
+        Assert.False(r3.Ok); // still reports API's failure
+        Assert.True(await TestProcesses.UntilAsync(() => File.Exists(marker), 10));
     }
 }
