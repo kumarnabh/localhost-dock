@@ -69,7 +69,7 @@ internal static class Theme
     {
         AppState.Up => Up,
         AppState.Down => Down,
-        AppState.Starting or AppState.Stopping => Pending,
+        AppState.Starting or AppState.Stopping or AppState.Conflict => Pending,
         _ => Unknown,
     };
 
@@ -135,6 +135,9 @@ internal static class Theme
                 case TextBox t:
                     t.BackColor = Input; t.ForeColor = Text; t.BorderStyle = BorderStyle.FixedSingle;
                     break;
+                case NumericUpDown n:
+                    n.BackColor = Input; n.ForeColor = Text; n.BorderStyle = BorderStyle.FixedSingle;
+                    break;
                 case ComboBox cb:
                     cb.BackColor = Input; cb.ForeColor = Text; cb.FlatStyle = FlatStyle.Flat;
                     break;
@@ -180,7 +183,18 @@ internal static class Theme
             using var dotBrush = new SolidBrush(dot);
             g.FillEllipse(dotBrush, 19, 17, 11, 11);
         }
-        return Icon.FromHandle(bmp.GetHicon());
+        // Icon.FromHandle doesn't take ownership of the HICON (a GDI leak on every colour change). Clone it into
+        // an Icon that owns its own copy, then free the original handle.
+        IntPtr hicon = bmp.GetHicon();
+        try
+        {
+            using var borrowed = Icon.FromHandle(hicon);
+            return (Icon)borrowed.Clone();
+        }
+        finally
+        {
+            Net.Native.DestroyIcon(hicon);
+        }
     }
 
     public static GraphicsPath RoundedRect(Rectangle r, int radius)
@@ -259,6 +273,7 @@ internal sealed class Dot : Control
         BackColor = Color.Transparent;
     }
 
+    [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
     public Color Color
     {
         get => _color;
@@ -266,6 +281,7 @@ internal sealed class Dot : Control
     }
 
     /// <summary>Draw as a ring (used for groups that are partly up).</summary>
+    [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
     public bool Ring
     {
         get => _ring;

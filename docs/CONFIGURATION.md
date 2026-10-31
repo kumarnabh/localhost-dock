@@ -8,7 +8,13 @@ Localhost Dock reads a single file:
 
 Set the `LOCALHOST_DOCK_HOME` environment variable to use a different folder, for example to keep the registry in a synced folder or to try out a demo registry. Captured logs go in a `logs` folder next to it.
 
-You rarely need to edit this file. Adding (drag-drop, *Scan a folder*, *Discovered → Add*, Explorer's right-click), editing (**⋯ → Edit…**), groups, ordering, Ignore and notification settings are all saved for you. To edit by hand, use tray menu → **Edit apps.json**, then **Reload apps.json**. If the file doesn't parse, the dock keeps the previous registry and shows you the error.
+You rarely need to edit this file. Adding (drag-drop, *Scan a folder*, *Discovered → Add*, Explorer's right-click), editing (**⋯ → Edit…**), groups, ordering, Ignore and notification settings are all saved for you. To edit by hand, use tray menu → **Edit apps.json**. The dock notices the change and reloads it.
+
+**Your edits are safe:**
+- The dock never overwrites a change made outside it. If you edited the file while the dock had unsaved changes, it keeps yours on disk, reloads, and tells you.
+- Every save first keeps the previous version in `backups\` (the last 20).
+- If `apps.json` becomes unreadable, it's kept as `apps.corrupt-<time>.json` and the newest readable backup is restored. A toast tells you.
+- Problems the dock can fix (duplicate names, invalid ports, unknown values, group members that don't exist) are fixed on load and listed in a toast.
 
 JSON comments (`//`, `/* */`) and trailing commas are allowed. Note that saving from the dock rewrites the file without comments, and leaves out fields that are at their default.
 
@@ -16,6 +22,7 @@ JSON comments (`//`, `/* */`) and trailing commas are allowed. Note that saving 
 
 | Field | Type | Default | Meaning |
 | --- | --- | --- | --- |
+| `schemaVersion` | number | `2` | File format version. Older files (no field) are migrated on load, with the original backed up as `backups\apps-…-pre-v2.json`. A file from a *newer* version is refused rather than misread |
 | `apps` | array | `[]` | Your apps, in the order they appear in the dock |
 | `groups` | array | `[]` | Start groups (see below) |
 | `ignoredPorts` | number[] | `[]` | Ports never offered under *Discovered* (filled by **Ignore**) |
@@ -28,16 +35,21 @@ JSON comments (`//`, `/* */`) and trailing commas are allowed. Note that saving 
 
 | Field | Type | Required | Meaning |
 | --- | --- | --- | --- |
+| `id` | string | auto | Stable identity, generated if missing. Groups and runtime state use it, so renaming an app is safe. Don't reuse one |
 | `name` | string | yes | Display name. Must be unique |
-| `port` | number | no* | Primary port. The status dot follows this port |
+| `port` | number | no* | Primary port. The dot is green when *this app's* process listens on it (see [Ownership](#ownership)) |
 | `extraPorts` | number[] | no | Other ports that belong to the app, e.g. the API behind a web front end. Shown on the row and freed by Stop |
 | `url` | string | no | What **Open** launches. Defaults to `http://localhost:{port}` |
 | `start` | string | no | Start command (see below). Without it, Start and Restart are disabled |
-| `stop` | string | no | Stop command (see below). Without it, Stop kills whatever holds the app's ports |
+| `stop` | string | no | Stop command (see below). Runs before anything is terminated |
 | `cwd` | string | no | Working directory for `start` and `stop`. Defaults to the launcher's folder |
 | `window` | string | no | `"minimized"` (default), `"normal"` or `"hidden"`: how the launched console window appears |
-| `captureLogs` | bool | no | Record everything `start` prints to `logs\<name>.log` (the window runs hidden). **View logs** tails it |
+| `captureLogs` | bool | no | Record everything `start` prints to `logs\<name>.<id>.log` (no window; stdin is empty, so `pause` can't hang). **View logs** tails it |
 | `logFile` | string | no | A log file your app already writes; **View logs** tails this instead |
+| `stopPolicy` | string | no | `"graceful"` (default: ask the app to exit, force after the timeout), `"graceful-only"` (never force-kill; Stop reports failure instead) or `"force"` |
+| `gracefulTimeoutSec` | number | no | Seconds to wait for a graceful exit (default 8, 1–300) |
+| `startTimeoutSec` | number | no | Seconds to wait for the port after Start (default 90, 5–1800) |
+| `startUnverified` | bool | no | Set when the start command was reconstructed from a running process. You're asked before it first runs, and it clears itself after a start that works |
 
 \* An app without a `port` still shows in the dock (grey dot) so you can keep a placeholder. Open, Stop and Restart need a port.
 
@@ -45,13 +57,14 @@ JSON comments (`//`, `/* */`) and trailing commas are allowed. Note that saving 
 
 ```json
 "groups": [
-  { "name": "Shop dev", "apps": ["Shop API", "Shop Web", "Shop Worker"] }
+  { "id": "…", "name": "Shop dev", "apps": ["<api id>", "<web id>", "<worker id>"], "onFailure": "stop" }
 ]
 ```
 
-- **Start all** starts members **in list order**. After each one, it waits up to 45 s for that app's port before starting the next, so an API is up before the web app that calls it. Apps that are already up are skipped.
-- **Stop all** stops members in **reverse** order, all at once.
-- An app can be in several groups. Renaming an app in the dock updates its group memberships, and removing an app removes it from its groups.
+- `apps` holds app **ids** in start order. When editing by hand you may write app **names**; they're converted to ids on load.
+- **Start all** starts members in order. Each must become *ready* (its own process listening on its port, within its `startTimeoutSec`) before the next starts. If a member fails (its start command exits with an error, or it times out) and `onFailure` is `"stop"` (default), the sequence stops there, so nothing starts against a missing dependency. With `"continue"` it carries on and reports the failures at the end. Members that are already up are skipped.
+- **Stop all** stops members **one at a time in reverse order**, each verified before the next.
+- An app can be in several groups. Renaming an app changes nothing in its groups, and removing an app removes it from them.
 
 ## How Start works
 
@@ -59,28 +72,51 @@ JSON comments (`//`, `/* */`) and trailing commas are allowed. Note that saving 
 
 | `start` value | Runs as |
 | --- | --- |
-| Path to an existing `.cmd` / `.bat` | `cmd.exe /c "<path>"`. Your launcher runs exactly as if you'd double-clicked it |
+| Path to an existing `.cmd` / `.bat` | `cmd.exe /d /s /c ""<path>""`. Your launcher runs exactly as if you'd double-clicked it |
 | Path to an existing `.ps1` | `powershell.exe -NoProfile -ExecutionPolicy Bypass -File "<path>"` |
 | Path to an existing `.exe` | The exe itself |
-| Anything else (`npm run dev`, `python -m http.server 8000`, …) | `cmd.exe /c <command>` |
+| Anything else (`npm run dev`, `python -m http.server 8000`, …) | `cmd.exe /d /s /c "<command>"` (`/s`: only the outermost quotes are removed, so quoting is predictable) |
 
 Paths can contain spaces and don't need quotes. Arguments after a file path aren't supported. If you need them, write the whole thing as a command line (`"C:\path\tool.exe" --flag`), which runs through `cmd.exe`.
 
 The process starts in its own console window (minimized by default), in `cwd`, or in the launcher's own folder if `cwd` isn't set. That matches launchers that do `cd /d "%~dp0"`.
 
-With `captureLogs`, the same command runs inside `cmd /c "… >> logs\<name>.log 2>&1"` in a hidden window. The log is restarted once it passes 5 MB.
+With `captureLogs`, the same command runs without a window. Its stdout and stderr go straight to the log file through inherited Windows handles (no shell redirection), and stdin is empty, so `pause` returns immediately. Logs rotate at 5 MB (`.1.log` … `.3.log` are kept). The app keeps logging even if the dock exits.
 
-After you click Start, the dot turns amber until the primary `port` starts listening, for up to 90 seconds.
+**Start is refused when:**
+- the app is already running or already starting (no duplicate launches);
+- another program holds the port. The message names it; free the port first.
 
-> **Tip:** if your launcher ends with `pause` on error, keep `window` as `minimized` or `normal` (and `captureLogs` off). A hidden window that's waiting at `pause` will never finish.
+After Start, the dot turns amber until the app's own process listens on the primary `port`, for up to `startTimeoutSec`. If the start command exits with an error code first, the start fails right away with that code.
+
+> **Tip:** if your launcher ends with `pause` on error, keep `window` as `minimized` or `normal` so you can see the message. With `"hidden"` it would wait forever; with `captureLogs` it doesn't wait at all.
 
 ## How Stop works
 
-1. If `stop` is set, it runs the same way as `start` (always minimized) and the dock waits up to 20 s for it to exit.
+1. If `stop` is set, it runs (minimized) and the dock waits up to 20 s for it. A non-zero exit code is reported.
 2. If the app's ports are free within 5 s after that, you're done.
-3. Otherwise (or if there's no `stop`), every process listening on `port` and `extraPorts` is killed along with its child processes (`taskkill /PID <pid> /T /F`). The console window the dock itself started for the app is closed too.
+3. Otherwise, each process still listening on `port`/`extraPorts` is checked for [ownership](#ownership):
+   - **The app's own** (started by the dock, or running from the app's folder): it's stopped according to `stopPolicy`. That means a graceful request (window close and Ctrl+C), then a force-stop of it *and its child processes* after `gracefulTimeoutSec`. Identity (PID + creation time + executable) is re-checked right before each process is stopped.
+   - **Unverified or someone else's**: you're shown what it is and why it doesn't look like this app, and it's stopped only if you say **Yes** (the default is No). Otherwise it's left running and Stop reports that.
+4. The console the dock itself started for the app is closed (same rules).
+5. Stop succeeds only if the ports are actually free afterwards.
 
-**Restart** is Stop followed by Start.
+**Restart** is Stop, then Start, and only if the stop completed. Only one Start/Stop/Restart runs per app at a time.
+
+Protected processes (Windows system processes, services, Localhost Dock itself and its parent) are never stopped.
+
+## Ownership
+
+How the dock decides a listening process belongs to an app:
+
+| Evidence | Ownership | Stop without asking? |
+| --- | --- | --- |
+| A verified descendant of the process the dock launched for the app (parent chain checked by creation time) | **owned** | yes |
+| Its working directory, command line or executable path is inside the app's folder (`cwd`, or the launcher's folder) | **matched** | yes |
+| Its details can't be read (elevated / other user), or the app has no folder to compare | **unverified** | asks |
+| Readable, but nothing points to the app's folder | **foreign** → the app shows a *port conflict* | asks |
+
+Tip: give apps a `cwd` (or a launcher path) so the dock can verify them. An app with only `"start": "npm run dev"` and no `cwd` will always be *unverified*.
 
 ## Examples
 
@@ -162,7 +198,14 @@ The suggested name comes from the command line (`vite` → "Vite", `uvicorn` →
 ## Command line
 
 ```
-LocalhostDock.exe [--show] [--add <launcher-or-folder>]
+LocalhostDock.exe [--show] [--add <launcher-or-folder>] [--exit] [--selftest]
 ```
 
-Only one dock runs per Windows user. Launching it again hands the arguments to the running instance: `--show` opens the dock, and `--add` opens the Add flow for that path.
+Only one dock runs per Windows user. Launching it again hands the arguments to the running instance:
+- `--show` opens the dock.
+- `--add` opens the Add flow for that path. It must be an existing, fully qualified file or folder.
+- `--exit` closes the running dock cleanly; the installer uses it.
+
+`--selftest` doesn't start the dock. It checks that this build can run on this machine and exits with 0, and the installer runs it before replacing a working installation.
+
+The hand-off uses a named pipe that only the same Windows user can connect to. Messages are size-limited, and anything other than these arguments is ignored.

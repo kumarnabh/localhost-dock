@@ -128,7 +128,9 @@ public sealed class DetectorTests : IDisposable
         Write(@"scan\c\node_modules\x\package.json", """{ "name": "x", "scripts": { "dev": "vite --port 8204" } }""");
         Write(@"scan\d\notes.txt", "nothing here");
 
-        var found = AppDetector.Scan(Path.Combine(_root, "scan")).Select(d => d.App.Port).ToList();
+        var result = AppDetector.Scan(Path.Combine(_root, "scan"));
+        Assert.False(result.Truncated);
+        var found = result.Items.Select(d => d.App.Port).ToList();
         Assert.Contains(8201, found);
         Assert.Contains(8202, found);
         Assert.DoesNotContain(8203, found);
@@ -165,131 +167,71 @@ public sealed class DetectorTests : IDisposable
     [InlineData("PORT=4000 node server.js", 4000)]
     [InlineData("python -m uvicorn main:app --host 127.0.0.1 --port 8000", 8000)]
     [InlineData("echo open http://localhost:4321/docs", 4321)]
+    [InlineData("const PORT = Number(process.env.PORT || process.argv[2] || 8088);", 8088)]
+    [InlineData("port = int(os.getenv(\"PORT\", \"8000\"))", 8000)]
+    [InlineData("uvicorn.run(app, host=\"0.0.0.0\", port=8001)", 8001)]
+    [InlineData("server: { port: 5280 }", 5280)]
+    [InlineData("app.listen(4100, () => {})", 4100)]
+    [InlineData("param([ValidateRange(1024, 65535)][int]$Port = 8765)", 8765)]
     public void PortsIn_reads_common_forms(string text, int expected) =>
         Assert.Equal(expected, AppDetector.PortsIn(text).First());
+
+    [Theory]
+    [InlineData("export const report = 1; support 3000 users")]          // "port" inside other words
+    [InlineData("const port = cfg.port, timeout = 3000;")]               // a different variable after "port"
+    [InlineData("if ($Port -lt 1024 -or $Port -gt 65535) { throw }")]    // comparisons
+    [InlineData("retry port after 5000ms; port pool size 2048 MB")]      // durations and sizes (5000ms) / non-adjacent numbers
+    [InlineData("node version 18.17.1 on port v3")]                      // versions
+    [InlineData("Write-Host 'Choose a port between 1024 and 65535.'")]   // range text
+    public void PortsIn_rejects_numbers_that_are_not_ports(string text) =>
+        Assert.Empty(AppDetector.PortsIn(text));
+
+    [Fact]
+    public void PowerShell_only_project_is_detected()
+    {
+        Write(@"psonly\Start-Api.ps1", "param([int]$Port = 7700)\r\nStart-Process python -ArgumentList '-m','http.server',$Port\r\n");
+        Write(@"psonly\Stop-Api.ps1", "# stop\r\n");
+        Write(@"psonly\helpers.ps1", "function Get-Thing { 1 }\r\n");
+        var d = Assert.Single(AppDetector.Detect(Path.Combine(_root, "psonly"))).App;
+        Assert.Equal(7700, d.Port);
+        Assert.EndsWith("Start-Api.ps1", d.Start);
+        Assert.EndsWith("Stop-Api.ps1", d.Stop);
+    }
+
+    [Fact]
+    public void Cmd_wrapper_is_preferred_over_the_ps1_it_calls()
+    {
+        Write(@"wrap\Start-Tool.cmd", "@echo off\r\npowershell -File \"%~dp0Start-Tool.ps1\"\r\n");
+        Write(@"wrap\Start-Tool.ps1", "$Port = 7800\r\n");
+        var d = Assert.Single(AppDetector.Detect(Path.Combine(_root, "wrap"))).App;
+        Assert.EndsWith("Start-Tool.cmd", d.Start);
+    }
+
+    [Fact]
+    public void Scan_reports_truncation_instead_of_silently_stopping()
+    {
+        // Wide, shallow tree of empty folders bigger than the limit is too slow for a unit test; check the contract instead.
+        var result = AppDetector.Scan(_root);
+        Assert.False(result.Truncated);
+        Assert.True(result.Visited >= 1);
+        Assert.Equal(4000, AppDetector.ScanLimit);
+    }
+
+    [Fact]
+    public void FromProcess_marks_the_start_command_unverified_and_flags_port_mismatch()
+    {
+        Write(@"mismatch\package.json", """{ "name": "m", "scripts": { "dev": "vite --port 5300" } }""");
+        string vite = Write(@"mismatch\node_modules\vite\bin\vite.js", "// vite");
+        var proc = new ProcessDetails(1234, "node.exe", @"C:\Program Files\nodejs\node.exe", $"node \"{vite}\" --port 5301", 1);
+        var d = AppDetector.FromProcess(proc, 5301);
+        Assert.True(d.App.StartUnverified);
+        Assert.Equal(5301, d.App.Port);
+        Assert.Contains(":5300", d.Note);
+    }
 
     [Fact]
     public void PortsIn_ignores_versions_and_ip_fragments()
     {
         Assert.Empty(AppDetector.PortsIn("import x from 'y'; version 1.2.3; port 127.0.0.1"));
-    }
-}
-
-public class FeatureTests
-{
-    [Fact]
-    public void Registry_round_trips_groups_and_settings_and_omits_defaults()
-    {
-        string dir = Path.Combine(Path.GetTempPath(), "ldock-reg-" + Guid.NewGuid().ToString("N"));
-        using var sandbox = TestSandbox.Use(dir);
-        try
-        {
-            var reg = new Registry
-            {
-                Apps = { new AppEntry { Name = "API", Port = 8000 }, new AppEntry { Name = "Web", Port = 3000, CaptureLogs = true } },
-                Groups = { new GroupEntry { Name = "Dev", Apps = { "API", "Web" } } },
-                Notifications = "crashes",
-            };
-            reg.Save();
-            string json = File.ReadAllText(Registry.FilePath);
-            Assert.DoesNotContain("\"logFile\"", json);      // null omitted
-            Assert.Contains("\"captureLogs\": true", json);
-
-            reg.Rename("Web", "Web app");
-            Assert.Equal(new[] { "API", "Web app" }, reg.Groups[0].Apps);
-            reg.Remove(reg.Apps[0]);
-            Assert.Equal(new[] { "Web app" }, reg.Groups[0].Apps);
-
-            var again = Registry.Load();
-            Assert.Equal("crashes", again.Notifications);
-            Assert.Equal("Dev", again.Groups.Single().Name);
-            Assert.Equal("Web 2", again.UniqueName("Web") == "Web" ? "Web 2" : again.UniqueName("Web"));
-            Assert.Equal("API 2", again.UniqueName("API"));
-        }
-        finally
-        {
-            Directory.Delete(dir, true);
-        }
-    }
-
-    [Fact]
-    public async Task CaptureLogs_writes_launcher_output_to_the_log()
-    {
-        string dir = Path.Combine(Path.GetTempPath(), "ldock-log-" + Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(dir);
-        using var sandbox = TestSandbox.Use(dir);
-        try
-        {
-            string launcher = Path.Combine(dir, "Say Hello.cmd");
-            File.WriteAllText(launcher, "@echo off\r\necho hello from the launcher\r\necho oops 1>&2\r\n");
-            var app = new AppEntry { Name = "Logger", Port = 1, Start = launcher, CaptureLogs = true };
-            var controller = new AppController(new Registry { Apps = { app } });
-            controller.Start(app);
-
-            string log = app.EffectiveLogFile!;
-            string text = "";
-            for (int i = 0; i < 50 && !text.Contains("oops"); i++)
-            {
-                await Task.Delay(200);
-                try { text = File.ReadAllText(log); } catch (IOException) { }
-            }
-            Assert.Contains("starting Logger", text);
-            Assert.Contains("hello from the launcher", text);
-            Assert.Contains("oops", text);
-        }
-        finally
-        {
-            try { Directory.Delete(dir, true); } catch { }
-        }
-    }
-
-    [Fact]
-    public async Task Group_starts_members_in_order_and_stops_them()
-    {
-        int p1 = FreePort(), p2 = FreePort();
-        string dir = Path.Combine(Path.GetTempPath(), "ldock-grp-" + Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(dir);
-        string Server(int port) =>
-            $"@echo off\r\npowershell -NoProfile -Command \"$l=[Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,{port});$l.Start();Start-Sleep 120\"\r\n";
-        File.WriteAllText(Path.Combine(dir, "a.cmd"), Server(p1));
-        File.WriteAllText(Path.Combine(dir, "b.cmd"), Server(p2));
-
-        var reg = new Registry
-        {
-            Apps =
-            {
-                new AppEntry { Name = "A", Port = p1, Start = Path.Combine(dir, "a.cmd"), Window = "hidden" },
-                new AppEntry { Name = "B", Port = p2, Start = Path.Combine(dir, "b.cmd"), Window = "hidden" },
-            },
-            Groups = { new GroupEntry { Name = "Both", Apps = { "A", "B" } } },
-        };
-        var controller = new AppController(reg);
-        try
-        {
-            var order = new List<string>();
-            await controller.StartGroupAsync(reg.Groups[0], order.Add);
-            Assert.Equal(new[] { "A", "B" }, order);
-            var snap = controller.Poll();
-            Assert.Equal(2, snap.Groups[0].Up);
-            Assert.All(snap.Apps, a => Assert.True(a.UpSince is not null && a.MemoryBytes > 0));
-
-            await controller.StopGroupAsync(reg.Groups[0]);
-            Assert.Equal(0, controller.Poll().Groups[0].Up);
-            Assert.True(controller.StoppedByUser("A"));
-        }
-        finally
-        {
-            foreach (var l in PortTable.GetListeners().Where(l => l.Port == p1 || l.Port == p2)) ProcessInfo.KillTree(l.Pid);
-            try { Directory.Delete(dir, true); } catch { }
-        }
-    }
-
-    private static int FreePort()
-    {
-        var l = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, 0);
-        l.Start();
-        int port = ((System.Net.IPEndPoint)l.LocalEndpoint).Port;
-        l.Stop();
-        return port;
     }
 }

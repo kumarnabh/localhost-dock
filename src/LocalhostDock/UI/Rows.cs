@@ -122,24 +122,51 @@ internal sealed class AppRow : HoverRow
         string ports = app.Port is null ? "" : string.Join(" ", app.AllPorts.Select(p => ":" + p));
         string state = s.State switch
         {
-            AppState.Up => s.UpSince is { } since ? $"up {Ago(DateTime.Now - since)}" : "up",
+            AppState.Up => (s.UpSince is { } since ? $"up {Ago(DateTime.Now - since)}" : "up") +
+                           (s.PrimaryOwnership == Ownership.Unverified ? " (owner unverified)" : ""),
+            AppState.Down when s.LastError is { } err => "failed: " + err,
+            AppState.Down when s.LastExit is { Expected: false } ex => ex.Code is int code ? $"crashed (exit code {code})" : "went down unexpectedly",
             AppState.Down => "down",
             AppState.Starting => "starting…",
             AppState.Stopping => "stopping…",
+            AppState.Conflict => $"port held by {s.ForeignHolder?.Identity?.ToString() ?? "another program"}",
             _ => "no port set; ⋯ → Edit to finish setup",
         };
+        if (app.StartUnverified && s.State != AppState.Up) state += " · start command unverified";
         string mem = s.State == AppState.Up && s.MemoryBytes > 0 ? $" · {Bytes(s.MemoryBytes)}" : "";
         string text = ports.Length > 0 ? $"{ports} · {state}{mem}" : state;
-        if (SubLabel.Text != text) SubLabel.Text = text;
+        if (SubLabel.Text != text)
+        {
+            SubLabel.Text = text;
+            SubLabel.ForeColor = s.State == AppState.Conflict || (s.State == AppState.Down && (s.LastError is not null || s.LastExit is { Expected: false }))
+                ? Pending : Muted;
+            Tips.SetToolTip(SubLabel, StatusExplanation(s) + "\n" + text);
+        }
 
         bool up = s.State == AppState.Up;
         bool busy = s.State is AppState.Starting or AppState.Stopping;
         bool hasStart = !string.IsNullOrWhiteSpace(app.Start);
         _open.Enabled = app.EffectiveUrl is not null;
-        _start.Enabled = hasStart && !up && !busy;
+        _start.Enabled = hasStart && !busy && s.State is AppState.Down or AppState.NotConfigured;
         _stop.Enabled = (up || s.Listeners.Count > 0) && s.State != AppState.Stopping;
         _restart.Enabled = hasStart && up && !busy;
+        Theme.Tips.SetToolTip(_stop, s.State == AppState.Conflict
+            ? "Stop: the process on this port isn't verified as this app, so you'll be asked first"
+            : "Stop");
     }
+
+    private static string StatusExplanation(AppStatus s) => s.State switch
+    {
+        AppState.Up when s.PrimaryOwnership == Ownership.Owned => "Running: started by Localhost Dock.",
+        AppState.Up when s.PrimaryOwnership == Ownership.Matched => "Running: the process on the port belongs to this app's folder.",
+        AppState.Up => "Something is listening on the port, but Localhost Dock can't verify it's this app. Stop will ask before closing it.",
+        AppState.Conflict => $"Another program holds this app's port ({s.ForeignHolder?.Evidence}). Start is blocked until the port is free.",
+        AppState.Down when s.LastExit is { Expected: false } ex => $"It went down without you stopping it ({ex.Process}{(ex.Code is int c ? $", exit code {c}" : "")}).",
+        AppState.Down => "Not running.",
+        AppState.Starting => "Waiting for the app to listen on its port.",
+        AppState.Stopping => "Asking the app to exit (force-stopping only if its stop policy allows).",
+        _ => "No port configured, so status can't be known.",
+    };
 
     private static string Describe(AppEntry a) =>
         string.Join("\n", new[]
@@ -154,6 +181,7 @@ internal sealed class GroupRow : HoverRow
 {
     private readonly Button _start, _stop;
     private readonly GroupEntry _group;
+    private List<string> _memberNames = new();
 
     public GroupRow(GroupEntry group, DockForm dock) : this(group, dock,
         IconButton(IconPlay, "Start all (in order)", (_, _) => dock.ActGroup(group, "start")),
@@ -172,14 +200,15 @@ internal sealed class GroupRow : HoverRow
     }
 
     public override bool Matches(string q) =>
-        _group.Name.Contains(q, StringComparison.OrdinalIgnoreCase) || _group.Apps.Any(a => a.Contains(q, StringComparison.OrdinalIgnoreCase));
+        _group.Name.Contains(q, StringComparison.OrdinalIgnoreCase) || _memberNames.Any(a => a.Contains(q, StringComparison.OrdinalIgnoreCase));
 
     public void Update(GroupStatus g)
     {
         int total = g.Members.Count, up = g.Up;
         DotControl.Color = g.Busy ? Pending : up == 0 ? Down : Up;
         DotControl.Ring = up > 0 && up < total && !g.Busy;
-        string text = $"{up} of {total} up · {string.Join(", ", g.Group.Apps)}";
+        _memberNames = g.Members.Select(m => m.App.Name).ToList();
+        string text = $"{up} of {total} up · {string.Join(", ", _memberNames)}" + (g.Group.OnFailure == "continue" ? " · continues past failures" : "");
         if (SubLabel.Text != text) SubLabel.Text = text;
         _start.Enabled = up < total && !g.Busy;
         _stop.Enabled = up > 0 && !g.Busy;
@@ -194,7 +223,7 @@ internal sealed class DiscoveredRow : HoverRow
     public DiscoveredRow(DiscoveredPort d, DockForm dock) : base(
         Theme.Button("Add", (_, _) => dock.AddDiscovered(d), primary: true),
         Theme.Button("Ignore", (_, _) => dock.Ignore(d.Port)),
-        IconButton(IconKill, "Kill (asks first)", (_, _) => dock.ConfirmKill(d.Port, d.Pid), danger: true))
+        IconButton(IconKill, "Kill (asks first)", (_, _) => dock.ConfirmKill(d.Port, d.Identity), danger: true))
     {
         _d = d;
         DotControl.Color = Accent;

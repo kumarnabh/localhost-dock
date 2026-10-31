@@ -198,8 +198,8 @@ internal sealed class DockForm : Form
         _summary.Text = $"{tracked.Count(a => a.State == AppState.Up)} of {tracked.Count} up" +
                         (snap.Discovered.Count > 0 ? $"  ·  {snap.Discovered.Count} unknown port{(snap.Discovered.Count == 1 ? "" : "s")}" : "");
 
-        string sig = string.Join("|", snap.Groups.Select(g => g.Group.Name + ":" + string.Join(",", g.Group.Apps))) + "#" +
-                     string.Join("|", snap.Apps.Select(a => a.App.Name)) + "#" +
+        string sig = string.Join("|", snap.Groups.Select(g => g.Group.Id + g.Group.Name + ":" + string.Join(",", g.Group.Apps))) + "#" +
+                     string.Join("|", snap.Apps.Select(a => a.App.Id + "=" + a.App.Name + (a.App.StartUnverified ? "?" : ""))) + "#" +
                      string.Join("|", snap.Discovered.Select(d => $"{d.Port}/{d.Pid}"));
         if (sig != _signature)
         {
@@ -207,9 +207,9 @@ internal sealed class DockForm : Form
             _signature = sig;
         }
         foreach (var s in snap.Apps)
-            if (_rows.TryGetValue(s.App.Name, out var row)) row.Update(s);
+            if (_rows.TryGetValue(s.App.Id, out var row)) row.Update(s);
         foreach (var g in snap.Groups)
-            if (_groupRows.TryGetValue(g.Group.Name, out var row)) row.Update(g);
+            if (_groupRows.TryGetValue(g.Group.Id, out var row)) row.Update(g);
     }
 
     private void Rebuild(Snapshot snap)
@@ -227,7 +227,7 @@ internal sealed class DockForm : Form
             foreach (var g in snap.Groups)
             {
                 var row = new GroupRow(g.Group, this);
-                _groupRows[g.Group.Name] = row;
+                _groupRows[g.Group.Id] = row;
                 _list.Controls.Add(row);
             }
         }
@@ -237,7 +237,7 @@ internal sealed class DockForm : Form
         foreach (var s in snap.Apps)
         {
             var row = new AppRow(s.App, this);
-            _rows[s.App.Name] = row;
+            _rows[s.App.Id] = row;
             _list.Controls.Add(row);
         }
 
@@ -376,11 +376,7 @@ internal sealed class DockForm : Form
 
     private void AddAll(List<AppEntry> apps)
     {
-        foreach (var a in apps)
-        {
-            a.Name = _controller.Registry.UniqueName(a.Name);
-            _controller.Registry.Apps.Add(a);
-        }
+        _controller.Mutate(r => { foreach (var a in apps) r.Add(a); });
         SaveAndRefresh();
         AfterAdd(apps.Count == 1 ? apps[0].Name : $"{apps.Count} apps");
     }
@@ -389,7 +385,7 @@ internal sealed class DockForm : Form
     {
         using var editor = new AppEditor(app, _controller.Registry, title, detectFrom, note);
         if (ShowModal(() => editor.ShowDialog(OwnerOrNull())) != DialogResult.OK) return;
-        if (isNew) _controller.Registry.Apps.Add(app);
+        if (isNew) _controller.Mutate(r => r.Add(app));
         SaveAndRefresh();
         if (isNew) AfterAdd(app.Name);
     }
@@ -403,6 +399,9 @@ internal sealed class DockForm : Form
 
     /// <summary>Raised after apps are added (the tray shows a confirmation).</summary>
     public event Action<string>? Added;
+
+    /// <summary>Raised when an operation finishes with a message worth showing (the tray shows it as a toast).</summary>
+    public event Action<string, string, bool>? OperationFinished;
 
     // ---- drag & drop
     private void EnableDrop(Control c)
@@ -435,27 +434,73 @@ internal sealed class DockForm : Form
 
     // ================================================================ app actions
 
-    internal async void Act(AppEntry app, string action)
+    /// <summary>The live registry entry for an app shown in a row (rows hold snapshot copies).</summary>
+    private AppEntry? Live(AppEntry app)
     {
+        lock (_controller.Registry.SyncRoot) return _controller.Registry.ById(app.Id)?.Clone();
+    }
+
+    internal async void Act(AppEntry shown, string action)
+    {
+        var app = Live(shown);
+        if (app is null) return;
+        OperationResult? result = null;
         try
         {
             switch (action)
             {
-                case "open": _controller.Open(app); Hide(); break;
-                case "start": _controller.Start(app); break;
-                case "stop": _requestPoll(); await _controller.StopAsync(app); break;
-                case "restart": _requestPoll(); await _controller.RestartAsync(app); break;
+                case "open":
+                    _controller.Open(app);
+                    Hide();
+                    break;
+                case "start":
+                    if (app.StartUnverified && !ConfirmUnverifiedStart(app)) return;
+                    result = await _controller.StartAsync(app);
+                    break;
+                case "stop":
+                    _requestPoll();
+                    result = await _controller.StopAsync(app, ConfirmForeignStop);
+                    break;
+                case "restart":
+                    _requestPoll();
+                    result = await _controller.RestartAsync(app, ConfirmForeignStop);
+                    break;
             }
         }
         catch (Exception ex)
         {
-            ShowModal(() => MessageBox.Show(this, ex.Message, $"{app.Name} — {action}", MessageBoxButtons.OK, MessageBoxIcon.Warning));
+            result = OperationResult.Fail(ex.Message);
         }
         _requestPoll();
+        if (result is { Ok: false })
+            ShowModal(() => MessageBox.Show(this, result.Message, $"{app.Name}: {action}", MessageBoxButtons.OK, MessageBoxIcon.Warning));
     }
 
-    internal void ShowAppMenu(AppEntry app, Control anchor, Point at)
+    private bool ConfirmUnverifiedStart(AppEntry app) =>
+        ShowModal(() => MessageBox.Show(this,
+            $"{app.Name}'s start command was worked out from a running process and hasn't been tested yet:\n\n{app.Start}\n\n" +
+            (app.Cwd is null ? "" : $"in {app.Cwd}\n\n") + "Run it now? (Use ⋯ → Edit… first if it doesn't look right.)",
+            $"Start {app.Name}", MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button1)) == DialogResult.Yes;
+
+    /// <summary>
+    /// Asked by Stop when the process on an app's port can't be verified as that app. Never answered implicitly:
+    /// the default button is No.
+    /// </summary>
+    private Task<bool> ConfirmForeignStop(AppEntry app, ProcessDetails holder, string reason)
     {
+        string cmd = holder.CommandLine ?? holder.ExecutablePath ?? "";
+        if (cmd.Length > 400) cmd = cmd[..400] + "…";
+        var answer = ShowModal(() => MessageBox.Show(this,
+            $"{holder.Name} (pid {holder.Pid}) is listening on {app.Name}'s port.\n\n{reason}\n\n{cmd}\n\n" +
+            "Stop it anyway? Only say Yes if you're sure it's safe to close.",
+            "Process not verified", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2));
+        return Task.FromResult(answer == DialogResult.Yes);
+    }
+
+    internal void ShowAppMenu(AppEntry shown, Control anchor, Point at)
+    {
+        var app = Live(shown);
+        if (app is null) return;
         var reg = _controller.Registry;
         var menu = DarkMenu.Create();
         string? folder = app.Folder;
@@ -467,20 +512,26 @@ internal sealed class DockForm : Form
         menu.Items.Add(new ToolStripSeparator());
 
         var groups = new ToolStripMenuItem("Add to group");
-        foreach (var g in reg.Groups)
+        List<GroupEntry> groupList;
+        int index, count;
+        lock (reg.SyncRoot)
         {
-            bool member = g.Apps.Contains(app.Name, StringComparer.OrdinalIgnoreCase);
-            var gi = DarkMenu.Item(g.Name, () => ToggleGroupMember(g, app));
-            gi.Checked = member;
+            groupList = reg.Groups.ToList();
+            index = reg.Apps.FindIndex(a => a.Id == app.Id);
+            count = reg.Apps.Count;
+        }
+        foreach (var g in groupList)
+        {
+            var gi = DarkMenu.Item(g.Name, () => ToggleGroupMember(g.Id, app.Id));
+            gi.Checked = g.Apps.Contains(app.Id);
             groups.DropDownItems.Add(gi);
         }
-        if (reg.Groups.Count > 0) groups.DropDownItems.Add(new ToolStripSeparator());
-        groups.DropDownItems.Add(DarkMenu.Item("New group…", () => EditGroup(null, app.Name)));
+        if (groupList.Count > 0) groups.DropDownItems.Add(new ToolStripSeparator());
+        groups.DropDownItems.Add(DarkMenu.Item("New group…", () => EditGroup(null, app.Id)));
         menu.Items.Add(groups);
 
-        int index = reg.Apps.IndexOf(app);
-        menu.Items.Add(DarkMenu.Item("Move up", () => MoveApp(app, -1), index > 0));
-        menu.Items.Add(DarkMenu.Item("Move down", () => MoveApp(app, 1), index >= 0 && index < reg.Apps.Count - 1));
+        menu.Items.Add(DarkMenu.Item("Move up", () => MoveApp(app.Id, -1), index > 0));
+        menu.Items.Add(DarkMenu.Item("Move down", () => MoveApp(app.Id, 1), index >= 0 && index < count - 1));
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(DarkMenu.Item("Edit…", () => EditApp(app)));
         menu.Items.Add(DarkMenu.Item("Duplicate…", () => DuplicateApp(app)));
@@ -494,20 +545,16 @@ internal sealed class DockForm : Form
     {
         var copy = app.Clone();
         using var editor = new AppEditor(copy, _controller.Registry, $"Edit {app.Name}");
-        // AppEditor renames group memberships itself; compare against the original entry for uniqueness.
-        int i = _controller.Registry.Apps.IndexOf(app);
-        _controller.Registry.Apps[i] = copy;
-        if (ShowModal(() => editor.ShowDialog(OwnerOrNull())) != DialogResult.OK)
-        {
-            _controller.Registry.Apps[i] = app;
-            return;
-        }
+        if (ShowModal(() => editor.ShowDialog(OwnerOrNull())) != DialogResult.OK) return;
+        // Groups refer to apps by Id, so renaming needs no follow-up.
+        _controller.Mutate(r => r.Replace(copy));
         SaveAndRefresh();
     }
 
     private void DuplicateApp(AppEntry app)
     {
         var copy = app.Clone();
+        copy.Id = "";
         copy.Name = _controller.Registry.UniqueName(app.Name + " copy");
         OpenEditor(copy, $"Duplicate {app.Name}", detectFrom: null, note: null, isNew: true);
     }
@@ -518,16 +565,18 @@ internal sealed class DockForm : Form
             $"Remove {app.Name} from the dock?\n\nThis doesn't stop it or touch its files.", "Remove app",
             MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2));
         if (answer != DialogResult.Yes) return;
-        _controller.Registry.Remove(app);
+        _controller.Mutate(r => r.Remove(app));
         SaveAndRefresh();
     }
 
-    private void MoveApp(AppEntry app, int delta)
+    private void MoveApp(string id, int delta)
     {
-        var apps = _controller.Registry.Apps;
-        int i = apps.IndexOf(app), j = i + delta;
-        if (i < 0 || j < 0 || j >= apps.Count) return;
-        (apps[i], apps[j]) = (apps[j], apps[i]);
+        _controller.Mutate(r =>
+        {
+            int i = r.Apps.FindIndex(a => a.Id == id), j = i + delta;
+            if (i < 0 || j < 0 || j >= r.Apps.Count) return;
+            (r.Apps[i], r.Apps[j]) = (r.Apps[j], r.Apps[i]);
+        });
         SaveAndRefresh();
     }
 
@@ -535,16 +584,19 @@ internal sealed class DockForm : Form
 
     internal async void ActGroup(GroupEntry group, string action)
     {
+        OperationResult result;
         try
         {
-            if (action == "start") await _controller.StartGroupAsync(group, _ => _requestPoll());
-            else await _controller.StopGroupAsync(group);
+            result = action == "start"
+                ? await _controller.StartGroupAsync(group, _ => _requestPoll())
+                : await _controller.StopGroupAsync(group, ConfirmForeignStop);
         }
         catch (Exception ex)
         {
-            ShowModal(() => MessageBox.Show(this, ex.Message, group.Name, MessageBoxButtons.OK, MessageBoxIcon.Warning));
+            result = OperationResult.Fail(ex.Message);
         }
         _requestPoll();
+        if (!result.Ok) OperationFinished?.Invoke(group.Name, result.Message, false);
     }
 
     internal void ShowGroupMenu(GroupEntry group, Control anchor, Point at)
@@ -552,12 +604,23 @@ internal sealed class DockForm : Form
         var menu = DarkMenu.Create();
         menu.Items.Add(DarkMenu.Item("Open all", () =>
         {
-            foreach (var a in group.Apps.Select(_controller.Registry.Find).Where(a => a?.EffectiveUrl is not null)) _controller.Open(a!);
+            List<AppEntry> members;
+            lock (_controller.Registry.SyncRoot)
+                members = group.Apps.Select(_controller.Registry.ById).Where(a => a?.EffectiveUrl is not null).Select(a => a!.Clone()).ToList();
+            foreach (var a in members) _controller.Open(a);
         }));
         menu.Items.Add(DarkMenu.Item("Edit…", () => EditGroup(group)));
+        var failure = DarkMenu.Item("If a member fails to start: stop", () => SetGroupFailure(group.Id, "stop"));
+        failure.Checked = group.OnFailure != "continue";
+        var cont = DarkMenu.Item("If a member fails to start: continue", () => SetGroupFailure(group.Id, "continue"));
+        cont.Checked = group.OnFailure == "continue";
+        menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add(failure);
+        menu.Items.Add(cont);
+        menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(DarkMenu.Item("Delete group", () =>
         {
-            _controller.Registry.Groups.Remove(group);
+            _controller.Mutate(r => r.Groups.RemoveAll(g => g.Id == group.Id));
             SaveAndRefresh();
         }, danger: true));
         _modal++;
@@ -565,7 +628,13 @@ internal sealed class DockForm : Form
         menu.Show(anchor, at);
     }
 
-    private void EditGroup(GroupEntry? group, string? withApp = null)
+    private void SetGroupFailure(string groupId, string policy)
+    {
+        _controller.Mutate(r => { if (r.Groups.FirstOrDefault(g => g.Id == groupId) is { } g) g.OnFailure = policy; });
+        SaveAndRefresh();
+    }
+
+    private void EditGroup(GroupEntry? group, string? withAppId = null)
     {
         if (_controller.Registry.Apps.Count == 0)
         {
@@ -573,19 +642,31 @@ internal sealed class DockForm : Form
             return;
         }
         bool isNew = group is null;
-        var target = group ?? new GroupEntry { Apps = withApp is null ? new() : new() { withApp } };
-        var working = new GroupEntry { Name = target.Name, Apps = target.Apps.ToList() };
-        using var editor = new GroupEditor(working, _controller.Registry, isNew ? "New group" : $"Edit {target.Name}");
+        var working = new GroupEntry
+        {
+            Id = group?.Id ?? Registry.NewId(),
+            Name = group?.Name ?? "",
+            Apps = group?.Apps.ToList() ?? (withAppId is null ? new() : new() { withAppId }),
+            OnFailure = group?.OnFailure ?? "stop",
+        };
+        using var editor = new GroupEditor(working, _controller.Registry, isNew ? "New group" : $"Edit {working.Name}");
         if (ShowModal(() => editor.ShowDialog(OwnerOrNull())) != DialogResult.OK) return;
-        target.Name = working.Name;
-        target.Apps = working.Apps;
-        if (isNew) _controller.Registry.Groups.Add(target);
+        _controller.Mutate(r =>
+        {
+            int i = r.Groups.FindIndex(g => g.Id == working.Id);
+            if (i >= 0) r.Groups[i] = working;
+            else r.Groups.Add(working);
+        });
         SaveAndRefresh();
     }
 
-    private void ToggleGroupMember(GroupEntry g, AppEntry app)
+    private void ToggleGroupMember(string groupId, string appId)
     {
-        if (g.Apps.RemoveAll(n => n.Equals(app.Name, StringComparison.OrdinalIgnoreCase)) == 0) g.Apps.Add(app.Name);
+        _controller.Mutate(r =>
+        {
+            if (r.Groups.FirstOrDefault(g => g.Id == groupId) is not { } g) return;
+            if (g.Apps.RemoveAll(id => id == appId) == 0) g.Apps.Add(appId);
+        });
         SaveAndRefresh();
     }
 
@@ -593,7 +674,7 @@ internal sealed class DockForm : Form
 
     internal void Ignore(int port)
     {
-        if (!_controller.Registry.IgnoredPorts.Contains(port)) _controller.Registry.IgnoredPorts.Add(port);
+        _controller.Mutate(r => { if (!r.IgnoredPorts.Contains(port)) r.IgnoredPorts.Add(port); });
         SaveAndRefresh();
     }
 
@@ -620,17 +701,21 @@ internal sealed class DockForm : Form
         {
             var d = ProcessInfo.Get(g.Key, fresh: true);
             string addrs = string.Join(", ", g.Select(l => l.Address).Distinct());
-            var owner = _controller.Registry.Apps.FirstOrDefault(a => a.AllPorts.Contains(port));
+            string? owner;
+            lock (_controller.Registry.SyncRoot) owner = _controller.Registry.Apps.FirstOrDefault(a => a.AllPorts.Contains(port))?.Name;
             var line = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Margin = Padding.Empty, BackColor = Surface };
             var lbl = new Label
             {
-                Text = $"{d?.Name ?? "?"} · pid {g.Key} · {addrs}" + (owner is not null ? $" · {owner.Name}" : ""),
+                Text = $"{d?.Name ?? "?"} · pid {g.Key} · {addrs}" + (owner is not null ? $" · configured for {owner}" : ""),
                 AutoSize = true, ForeColor = Theme.Text, Margin = new Padding(0, S(6), S(6), 0),
             };
-            Tips.SetToolTip(lbl, d?.CommandLine ?? d?.ExecutablePath ?? "");
+            Tips.SetToolTip(lbl, d?.CommandLine ?? d?.ExecutablePath ?? d?.Restriction ?? "");
             line.Controls.Add(lbl);
-            if (d is not null && !d.IsCritical)
-                line.Controls.Add(Theme.Button("Kill", (_, _) => ConfirmKill(port, g.Key), danger: true));
+            // Capture the identity now; the kill revalidates it, so a recycled PID is never hit.
+            if (d?.Identity is { } id && ProcessGuard.WhyProtected(id) is null)
+                line.Controls.Add(Theme.Button("Kill", (_, _) => ConfirmKill(port, id), danger: true));
+            else if (d?.Identity is { } pid && ProcessGuard.WhyProtected(pid) is { } why)
+                line.Controls.Add(new Label { Text = $"protected: {why}", ForeColor = Muted, Font = Small, AutoSize = true, Margin = new Padding(0, S(7), 0, 0) });
             AddLookupLine(line);
         }
     }
@@ -642,31 +727,35 @@ internal sealed class DockForm : Form
         if (Visible) FitToContent();
     }
 
-    internal void ConfirmKill(int port, int pid)
+    internal async void ConfirmKill(int port, ProcessIdentity? identity)
     {
-        var d = ProcessInfo.Get(pid, fresh: true);
-        if (d is null)
+        if (identity is null || !identity.IsAlive())
         {
+            string message = identity is null
+                ? "Windows doesn't allow Localhost Dock to inspect this process (it's elevated, protected or belongs to another user), " +
+                  "so it can't be verified or stopped from here. Use an elevated Task Manager if you're sure."
+                : "That process has already exited.";
+            ShowModal(() => MessageBox.Show(this, message, "Kill", MessageBoxButtons.OK, MessageBoxIcon.Information));
             _requestPoll();
             return;
         }
-        if (d.IsCritical)
+        if (ProcessGuard.WhyProtected(identity) is { } why)
         {
-            ShowModal(() => MessageBox.Show(this, $"{d.Name} is a system process; Localhost Dock won't kill it.",
-                "Kill", MessageBoxButtons.OK, MessageBoxIcon.Information));
+            ShowModal(() => MessageBox.Show(this, $"Localhost Dock won't stop {identity}: {why}.", "Kill", MessageBoxButtons.OK, MessageBoxIcon.Information));
             return;
         }
 
-        string detail = d.CommandLine ?? d.ExecutablePath ?? "";
+        var d = ProcessInfo.Get(identity.Pid, fresh: true);
+        string detail = d?.CommandLine ?? d?.ExecutablePath ?? d?.Restriction ?? "";
         if (detail.Length > 400) detail = detail[..400] + "…";
         var answer = ShowModal(() => MessageBox.Show(this,
-            $"Kill {d.Name} (pid {pid}) and its child processes?\n\nIt is listening on :{port}.\n\n{detail}",
+            $"Stop {identity} and its child processes?\n\nIt is listening on :{port}. It will be asked to exit first, then forced after 5 seconds.\n\n{detail}",
             "Confirm kill", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2));
         if (answer != DialogResult.Yes) return;
 
-        string? error = ProcessInfo.KillTree(pid);
-        if (error is not null)
-            ShowModal(() => MessageBox.Show(this, error, "Kill failed", MessageBoxButtons.OK, MessageBoxIcon.Error));
+        var result = await _controller.KillAsync(identity);
+        if (!result.Ok)
+            ShowModal(() => MessageBox.Show(this, result.Message, "Kill", MessageBoxButtons.OK, MessageBoxIcon.Warning));
         if (_lookupResult.Controls.Count > 0) LookupPort();
         _requestPoll();
     }
@@ -681,7 +770,19 @@ internal sealed class DockForm : Form
 
     private void SaveAndRefresh()
     {
-        try { _controller.Registry.Save(); }
+        try
+        {
+            lock (_controller.Registry.SyncRoot) _controller.Registry.Save();
+        }
+        catch (RegistryConflictException)
+        {
+            // Someone edited apps.json by hand meanwhile: never overwrite their edit. Reload theirs instead.
+            ShowModal(() => MessageBox.Show(this,
+                "apps.json was changed outside Localhost Dock, so your last change here wasn't saved (to avoid overwriting that edit).\n\n" +
+                "The dock has reloaded the file; please redo the change.",
+                "apps.json changed on disk", MessageBoxButtons.OK, MessageBoxIcon.Information));
+            RegistryReloadRequested?.Invoke();
+        }
         catch (Exception ex)
         {
             ShowModal(() => MessageBox.Show(this, ex.Message, "Could not save apps.json", MessageBoxButtons.OK, MessageBoxIcon.Error));
@@ -689,6 +790,9 @@ internal sealed class DockForm : Form
         ForceRebuild();
         _requestPoll();
     }
+
+    /// <summary>Raised when the dock needs the registry reloaded from disk (TrayApp owns reloading).</summary>
+    public event Action? RegistryReloadRequested;
 
     private IWin32Window? OwnerOrNull() => Visible ? this : null;
 

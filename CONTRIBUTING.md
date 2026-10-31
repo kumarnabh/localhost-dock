@@ -4,7 +4,7 @@ Thanks for helping! Issues and pull requests are welcome.
 
 ## Getting set up
 
-You need Windows 10/11 and the [.NET 8 SDK](https://dotnet.microsoft.com/download/dotnet/8.0).
+You need Windows 10/11, the [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0), and Node.js on PATH (the tests use small `node` listeners).
 
 ```powershell
 dotnet build
@@ -24,7 +24,7 @@ Only one instance runs at a time, so quit the installed copy first (tray menu â†
 ## Guidelines
 
 - Keep it dependency-light: the app ships as one small exe on the .NET Desktop Runtime.
-- Anything that kills a process must stay behind a confirmation, except Stop on a registered app (see the README's Safety section).
+- **Process safety is non-negotiable.** Never terminate a process except through `ProcessGuard`, and never stop a process that isn't verifiably the app's (owned/matched) without explicit user confirmation. Any change near process control needs a test in `SafetyTests`; a release can't ship while those fail.
 - Never write to a user's launcher scripts. Localhost Dock reuses them; it doesn't manage them.
 - Add or update tests in `tests/LocalhostDock.Tests` for changes to `Core/`, `Net/` or `Config/`. Tests that need their own registry folder must use `TestSandbox.Use(dir)`: the test run is sandboxed so it can never touch a real `%APPDATA%\LocalhostDock`.
 - Detection improvements are very welcome: add a test with a small folder layout that reproduces the launcher or project shape.
@@ -32,4 +32,4 @@ Only one instance runs at a time, so quit the installed copy first (tray menu â†
 
 ## Releasing
 
-Push a tag like `v0.2.0`. CI builds, tests, publishes a single-file exe and attaches a zip to a GitHub release.
+Push a tag like `v0.3.0`. CI builds, runs the dependency vulnerability scan and every test (including the process-safety suite), publishes framework-dependent and self-contained single-file builds, self-tests both, and only then attaches the zips and `SHA256SUMS.txt` to a GitHub release.

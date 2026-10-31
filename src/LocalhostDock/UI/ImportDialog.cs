@@ -120,13 +120,18 @@ internal sealed class ImportDialog : Form
         tick.Start();
         try
         {
-            var found = await Task.Run(() => AppDetector.Scan(root, 3, token, d => current = d), token);
-            if (!_registry.ScanFolders.Contains(root, StringComparer.OrdinalIgnoreCase))
+            var result = await Task.Run(() => AppDetector.Scan(root, 3, token, d => current = d), token);
+            lock (_registry.SyncRoot)
             {
-                _registry.ScanFolders.Add(root);
-                if (_registry.ScanFolders.Count > 5) _registry.ScanFolders.RemoveAt(0);
+                if (!_registry.ScanFolders.Contains(root, StringComparer.OrdinalIgnoreCase))
+                {
+                    _registry.ScanFolders.Add(root);
+                    if (_registry.ScanFolders.Count > 5) _registry.ScanFolders.RemoveAt(0);
+                }
             }
-            ShowResults(found);
+            ShowResults(result.Items);
+            if (result.Truncated)
+                _status.Text = $"⚠ Stopped after {AppDetector.ScanLimit:N0} folders, so some apps may be missing. Scan a narrower folder. " + _status.Text;
         }
         catch (OperationCanceledException) { }
         finally

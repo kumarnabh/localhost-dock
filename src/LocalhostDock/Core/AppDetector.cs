@@ -8,6 +8,9 @@ namespace LocalhostDock.Core;
 /// <summary>A suggested registry entry and a human-readable note on how it was worked out.</summary>
 public sealed record Detection(AppEntry App, string Note);
 
+/// <summary>Result of a folder scan. <see cref="Truncated"/> means the directory limit was hit before the walk finished.</summary>
+public sealed record ScanResult(List<Detection> Items, bool Truncated, int Visited);
+
 /// <summary>
 /// Turns a launcher file, a project folder or a running process into a ready-to-save <see cref="AppEntry"/>:
 /// name, port(s), URL, start/stop commands and working directory.
@@ -61,13 +64,17 @@ public static partial class AppDetector
                 {
                     var best = found.FirstOrDefault(f => f.App.AllPorts.Contains(port)) ?? found[0];
                     var app = best.App;
-                    if (app.Port != port)
+                    // Reconstructed, not observed: flag it until a Start from the dock is seen to work.
+                    app.StartUnverified = true;
+                    string mismatch = "";
+                    if (app.Port is int scripted && scripted != port)
                     {
+                        mismatch = $" Note: its scripts suggest :{scripted}, but it's running on :{port}; check that Start really uses :{port}.";
                         app.ExtraPorts.Remove(port);
                         app.Port = port;
                         app.Url = null;
                     }
-                    return new Detection(app, $"Traced :{port} to {probe}. {best.Note}");
+                    return new Detection(app, $"Traced :{port} to {probe}. {best.Note}{mismatch}");
                 }
                 if (Path.GetPathRoot(probe) == probe || Depth(dir) - Depth(probe) >= 4) break;
             }
@@ -78,21 +85,26 @@ public static partial class AppDetector
             Name = AppController.Guess(d, port).Split(" :")[0],
             Port = port,
             Start = d.CommandLine,
-            Cwd = CandidateDirsFromCommandLine(d).FirstOrDefault(),
+            Cwd = ProcessCwd.TryGet(d.Pid) ?? CandidateDirsFromCommandLine(d).FirstOrDefault(),
+            StartUnverified = true,
         };
-        return new Detection(fallback, "Couldn't find a launcher or project for this process, so Start re-runs its exact command line.");
+        return new Detection(fallback, "Couldn't find a launcher or project for this process, so Start re-runs its exact command line " +
+                                       "(unverified until it's been started once from the dock).");
     }
 
+    public const int ScanLimit = 4000;
+
     /// <summary>Walks a folder tree (not into node_modules, .git, bin, …) and collects every app it can find.</summary>
-    public static List<Detection> Scan(string root, int maxDepth = 3, CancellationToken ct = default, Action<string>? progress = null)
+    public static ScanResult Scan(string root, int maxDepth = 3, CancellationToken ct = default, Action<string>? progress = null)
     {
         var results = new List<Detection>();
         var queue = new Queue<(string Dir, int Depth)>();
         queue.Enqueue((root, 0));
         int visited = 0;
 
-        while (queue.Count > 0 && visited < 4000)
+        while (queue.Count > 0)
         {
+            if (visited >= ScanLimit) return new ScanResult(Dedupe(results), Truncated: true, visited);
             ct.ThrowIfCancellationRequested();
             var (dir, depth) = queue.Dequeue();
             visited++;
@@ -117,7 +129,7 @@ public static partial class AppDetector
             }
             catch { /* access denied etc. */ }
         }
-        return Dedupe(results);
+        return new ScanResult(Dedupe(results), Truncated: false, visited);
     }
 
     // ------------------------------------------------------------------ files
@@ -252,18 +264,30 @@ public static partial class AppDetector
         try { files = Directory.EnumerateFiles(dir).ToList(); }
         catch { return results; }
 
+        // .cmd/.bat are launchers by nature; a .ps1 counts when its name says so (Start-X.ps1, X-Start.ps1, run.ps1),
+        // so PowerShell-only projects are found too.
         var launchers = files
-            .Where(f => Path.GetExtension(f).ToLowerInvariant() is ".cmd" or ".bat")
+            .Where(f => Path.GetExtension(f).ToLowerInvariant() switch
+            {
+                ".cmd" or ".bat" => true,
+                ".ps1" => PsLauncherName().IsMatch(Path.GetFileNameWithoutExtension(f)),
+                _ => false,
+            })
             .Where(f => !NotLaunchers.Any(w => Path.GetFileNameWithoutExtension(f).Contains(w, StringComparison.OrdinalIgnoreCase)))
             .OrderByDescending(f => StartWord().IsMatch(Path.GetFileNameWithoutExtension(f)))
             .ToList();
         foreach (var l in launchers)
             if (FromFile(l) is { } d) results.Add(d);
 
-        // A folder full of launchers that all point at the same port is one app; keep the best-looking one.
+        // A folder full of launchers that all point at the same port is one app; keep the best-looking one
+        // (has a stop script, then the .cmd/.bat wrapper over the .ps1 it calls, then a "start" name).
         results = results
             .GroupBy(r => r.App.Port?.ToString() ?? r.App.Start)
-            .Select(g => g.OrderByDescending(r => r.App.Stop is not null).ThenByDescending(r => StartWord().IsMatch(r.App.Start ?? "")).First())
+            .Select(g => g
+                .OrderByDescending(r => r.App.Stop is not null)
+                .ThenByDescending(r => !(r.App.Start ?? "").EndsWith(".ps1", StringComparison.OrdinalIgnoreCase))
+                .ThenByDescending(r => StartWord().IsMatch(Path.GetFileName(r.App.Start ?? "")))
+                .First())
             .ToList();
 
         // 2. Node projects / monorepos
@@ -499,10 +523,20 @@ public static partial class AppDetector
     [GeneratedRegex(@"(?:%~dp0|\$PSScriptRoot[\\/]|\./|\.\\)(?<p>[^""'\s%*|<>]+)|""(?<p>[^""%*|<>\r\n]+\.(?:ps1|cmd|bat|py|js|mjs|cjs))""", RegexOptions.IgnoreCase)]
     private static partial Regex ScriptReference();
 
-    // "port 8765", "$Port = 8765", "--port=5173", "-Port 3000", "PORT: 4000", "-p 3001", "localhost:4780", "127.0.0.1:8000",
-    // "python -m http.server 8000", "manage.py runserver 8000"
-    [GeneratedRegex(@"\bport\b[^\n]{0,60}?(?<![\d.])(\d{2,5})(?![\d.])|(?:^|\s)-p\s+(\d{2,5})\b|(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]):(\d{2,5})\b|(?:http\.server|runserver)\s+(?:[\d.]+:)?(\d{2,5})\b", RegexOptions.IgnoreCase | RegexOptions.Multiline)]
+    // Port mentions, strictly: the number must follow the word "port" with only separators or known fallback
+    // expressions in between, so "port, timeout = 3000", "$Port -lt 1024", "version 1.2" or "5000ms" don't count.
+    //   "port 8765", "$Port = 8765", "--port=5173", "-Port 3000", "PORT: 4000", "port=8000)",
+    //   "process.env.PORT || process.argv[2] || 8088", "os.getenv("PORT", "8000")",
+    //   "-p 3001", "localhost:4780", "127.0.0.1:8000", "http.server 8000", "runserver 8000", ".listen(3000"
+    [GeneratedRegex(@"\bport\b(?:[\s:='""\]>,]|\|\||\?\?|\bor\b|process\.env\.\w+|process\.argv\[\d\]|\$env:\w+|os\.environ(?:\.get)?|\.get\(|getenv\(|env\.\w+)*?(?<![\w.$-])(\d{2,5})(?![\d.]|\s*(?:ms|sec|seconds|mb|kb|gb|px)\b|\s*%)" +
+                    @"|(?:^|\s)-p\s+(\d{2,5})\b" +
+                    @"|(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]):(\d{2,5})\b" +
+                    @"|(?:http\.server|runserver)\s+(?:[\d.]+:)?(\d{2,5})\b" +
+                    @"|\.listen\(\s*(\d{2,5})\b", RegexOptions.IgnoreCase | RegexOptions.Multiline)]
     private static partial Regex PortMention();
+
+    [GeneratedRegex(@"^(?:start|launch|run|serve|dev)\b|[\s\-_](?:start|launch|run|serve)$", RegexOptions.IgnoreCase)]
+    private static partial Regex PsLauncherName();
 
     [GeneratedRegex(@"\s-(?:lt|gt|le|ge|eq|ne)\s|[<>]|[=!]=", RegexOptions.IgnoreCase)]
     private static partial Regex ComparisonOperator();

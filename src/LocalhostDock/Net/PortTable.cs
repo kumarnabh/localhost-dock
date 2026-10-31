@@ -17,15 +17,17 @@ public static class PortTable
     private static extern uint GetExtendedTcpTable(IntPtr pTcpTable, ref int pdwSize, bool bOrder,
         int ulAf, int tableClass, uint reserved);
 
+    /// <summary>Distinct listening sockets: one entry per (port, PID, bound address).</summary>
     public static List<Listener> GetListeners()
     {
         var result = new List<Listener>();
         Read(AF_INET, result);
         Read(AF_INET6, result);
+        // Keep every distinct binding (e.g. 127.0.0.1:3000 and [::1]:3000 can be different processes).
         return result
-            .GroupBy(l => (l.Port, l.Pid))
-            .Select(g => g.First())
+            .Distinct()
             .OrderBy(l => l.Port)
+            .ThenBy(l => l.Address, StringComparer.Ordinal)
             .ToList();
     }
 

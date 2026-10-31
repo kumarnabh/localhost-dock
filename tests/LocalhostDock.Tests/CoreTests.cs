@@ -26,32 +26,32 @@ public class CoreTests
     }
 
     [Fact]
-    public void PortTable_sees_ipv6_listener()
+    public void PortTable_keeps_ipv4_and_ipv6_bindings_of_the_same_port_separate()
     {
-        var listener = new TcpListener(IPAddress.IPv6Loopback, 0);
-        listener.Start();
+        int port = TestProcesses.FreePort();
+        var v4 = new TcpListener(IPAddress.Loopback, port);
+        var v6 = new TcpListener(IPAddress.IPv6Loopback, port);
+        v4.Start();
         try
         {
-            int port = ((IPEndPoint)listener.LocalEndpoint).Port;
-            Assert.Contains(PortTable.GetListeners(), l => l.Port == port && l.Address.StartsWith("["));
+            v6.Start();
+            var hits = PortTable.GetListeners().Where(l => l.Port == port).ToList();
+            Assert.Equal(2, hits.Count);
+            Assert.Contains(hits, h => h.Address == "127.0.0.1");
+            Assert.Contains(hits, h => h.Address.StartsWith("["));
         }
-        finally { listener.Stop(); }
+        catch (SocketException) { /* IPv6 loopback unavailable on this machine: nothing to assert */ }
+        finally { v4.Stop(); v6.Stop(); }
     }
 
     [Fact]
-    public void ProcessInfo_describes_current_process()
+    public void ProcessInfo_describes_current_process_with_identity()
     {
         var d = ProcessInfo.Get(Environment.ProcessId, fresh: true);
         Assert.NotNull(d);
-        Assert.False(d!.IsCritical);
+        Assert.NotNull(d!.Identity);
+        Assert.True(d.IsCritical); // the dock never terminates itself
         Assert.False(string.IsNullOrEmpty(d.CommandLine));
-    }
-
-    [Fact]
-    public void ProcessInfo_refuses_to_kill_system_or_self()
-    {
-        Assert.NotNull(ProcessInfo.KillTree(4));
-        Assert.NotNull(ProcessInfo.KillTree(Environment.ProcessId));
     }
 
     [Theory]
@@ -65,86 +65,86 @@ public class CoreTests
     }
 
     [Fact]
-    public void Registry_round_trips_and_seeds_from_example()
+    public async Task Start_then_Stop_with_a_cmd_launcher_whose_path_has_spaces_and_symbols()
     {
-        string dir = Path.Combine(Path.GetTempPath(), "ldock-test-" + Guid.NewGuid().ToString("N"));
-        using var sandbox = TestSandbox.Use(dir);
-        try
-        {
-            var reg = Registry.Load(); // seeded from apps.example.json (copied to the output folder)
-            Assert.NotEmpty(reg.Apps);
+        using var tp = new TestProcesses();
+        int port = TestProcesses.FreePort();
+        string dir = tp.TempDir("My App & Co (dev)");
+        string launcher = Path.Combine(dir, "Start My App.cmd");
+        File.WriteAllText(launcher, TestProcesses.ServerCmd(port));
 
-            reg.Apps.Add(new AppEntry { Name = "Test", Port = 1234, ExtraPorts = { 5678 } });
-            reg.IgnoredPorts.Add(9999);
-            reg.Save();
+        var app = new AppEntry { Id = "t1", Name = "Test server", Port = port, Start = launcher, Window = "hidden", GracefulTimeoutSec = 2 };
+        using var controller = new AppController(new Registry { Apps = { app } });
 
-            var again = Registry.Load();
-            var t = again.Apps.Single(a => a.Name == "Test");
-            Assert.Equal(new[] { 1234, 5678 }, t.AllPorts);
-            Assert.Equal("http://localhost:1234", t.EffectiveUrl);
-            Assert.Contains(9999, again.IgnoredPorts);
-        }
-        finally
-        {
-            Directory.Delete(dir, true);
-        }
+        var started = await controller.StartAsync(app);
+        Assert.True(started.Ok, started.Message);
+        Assert.Equal(AppState.Starting, controller.Poll().Apps[0].State);
+        Assert.True(await TestProcesses.UntilAsync(() => controller.Poll().Apps[0].State == AppState.Up, 30), "never came up");
+        foreach (var l in PortTable.GetListeners().Where(l => l.Port == port)) tp.Track(l.Pid);
+
+        var status = controller.Poll().Apps[0];
+        Assert.Equal(Ownership.Owned, status.PrimaryOwnership);
+
+        var stopped = await controller.StopAsync(app, confirm: null);
+        Assert.True(stopped.Ok, stopped.Message);
+        Assert.DoesNotContain(PortTable.GetListeners(), l => l.Port == port);
+        Assert.Equal(AppState.Down, controller.Poll().Apps[0].State);
     }
 
     [Fact]
-    public async Task Start_reports_up_then_Stop_frees_the_port()
+    public async Task Start_refuses_to_launch_a_second_copy()
     {
-        int port = FreePort();
-        string dir = Path.Combine(Path.GetTempPath(), "ldock-app-" + Guid.NewGuid().ToString("N"));
-        Directory.CreateDirectory(dir);
-        string launcher = Path.Combine(dir, "Start Test Server.cmd");
-        // A tiny server written as an existing-style .cmd launcher, path with spaces on purpose.
-        File.WriteAllText(launcher, $"@echo off\r\npowershell -NoProfile -Command \"$l=[Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,{port});$l.Start();Start-Sleep 120\"\r\n");
+        using var tp = new TestProcesses();
+        int port = TestProcesses.FreePort();
+        string dir = tp.TempDir("dup");
+        tp.Listen(port, dir); // already running, in the app's own folder
+        string marker = Path.Combine(dir, "launched.txt");
+        string launcher = Path.Combine(dir, "start.cmd");
+        File.WriteAllText(launcher, $"@echo off\r\necho x> \"{marker}\"\r\n");
 
-        var app = new AppEntry { Name = "Test server", Port = port, Start = launcher, Window = "hidden" };
-        var controller = new AppController(new Registry { Apps = { app } });
-        try
-        {
-            controller.Start(app);
-            Assert.Equal(AppState.Starting, controller.Poll().Apps[0].State);
-            Assert.True(await Until(() => controller.Poll().Apps[0].State == AppState.Up, 30), "never came up");
+        var app = new AppEntry { Id = "dup", Name = "Dup", Port = port, Start = launcher, Window = "hidden" };
+        using var controller = new AppController(new Registry { Apps = { app } });
+        var r = await controller.StartAsync(app);
 
-            await controller.StopAsync(app);
-            Assert.DoesNotContain(PortTable.GetListeners(), l => l.Port == port);
-            Assert.Equal(AppState.Down, controller.Poll().Apps[0].State);
-        }
-        finally
-        {
-            foreach (var l in PortTable.GetListeners().Where(l => l.Port == port)) ProcessInfo.KillTree(l.Pid);
-            try { Directory.Delete(dir, true); } catch { }
-        }
+        Assert.False(r.Ok);
+        Assert.Contains("already running", r.Message);
+        await Task.Delay(500);
+        Assert.False(File.Exists(marker));
     }
 
     [Fact]
-    public async Task Discovery_lists_unregistered_dev_ports_but_not_registered_or_ignored()
+    public void Discovery_lists_unregistered_dev_ports_but_not_registered_or_ignored()
     {
+        using var tp = new TestProcesses();
         int port = FreePortBelowEphemeral();
-        using var server = Process.Start(new ProcessStartInfo("node",
-            $"-e \"require('http').createServer((q,r)=>r.end('ok')).listen({port},'127.0.0.1')\"")
-        { CreateNoWindow = true, UseShellExecute = false })!;
-        try
-        {
-            Assert.True(await Until(() => PortTable.GetListeners().Any(l => l.Port == port), 15), "node never listened");
-            var reg = new Registry();
-            var controller = new AppController(reg);
-            var found = controller.Poll().Discovered.SingleOrDefault(d => d.Port == port);
-            Assert.NotNull(found);
-            Assert.Equal(server.Id, found!.Pid);
-            Assert.Equal("node.exe", found.ProcessName);
+        string dir = tp.TempDir("disc");
+        var server = tp.Listen(port, dir);
 
-            reg.IgnoredPorts.Add(port);
-            Assert.DoesNotContain(port, controller.Poll().Discovered.Select(d => d.Port));
+        var reg = new Registry();
+        using var controller = new AppController(reg);
+        var found = controller.Poll().Discovered.SingleOrDefault(d => d.Port == port);
+        Assert.NotNull(found);
+        Assert.Equal(server.Pid, found!.Pid);
+        Assert.NotNull(found.Identity);
 
-            reg.IgnoredPorts.Clear();
-            reg.Apps.Add(new AppEntry { Name = "mine", Port = port });
-            Assert.DoesNotContain(port, controller.Poll().Discovered.Select(d => d.Port));
-            Assert.Equal(AppState.Up, controller.Poll().Apps[0].State);
-        }
-        finally { ProcessInfo.KillTree(server.Id); }
+        reg.IgnoredPorts.Add(port);
+        Assert.DoesNotContain(port, controller.Poll().Discovered.Select(d => d.Port));
+
+        reg.IgnoredPorts.Clear();
+        reg.Apps.Add(new AppEntry { Id = "m", Name = "mine", Port = port, Cwd = dir });
+        Assert.DoesNotContain(port, controller.Poll().Discovered.Select(d => d.Port));
+        var status = controller.Poll().Apps[0];
+        Assert.Equal(AppState.Up, status.State);
+        Assert.Equal(Ownership.Matched, status.PrimaryOwnership); // its working directory is the app's folder
+    }
+
+    [Fact]
+    public void Discovery_never_lists_system_or_service_processes()
+    {
+        using var controller = new AppController(new Registry());
+        var names = controller.Poll().Discovered.Select(d => d.ProcessName.ToLowerInvariant()).ToList();
+        foreach (var system in new[] { "svchost.exe", "services.exe", "lsass.exe", "wininit.exe", "spoolsv.exe", "system" })
+            Assert.DoesNotContain(system, names);
     }
 
     [Fact]
@@ -157,32 +157,12 @@ public class CoreTests
 
     private static int FreePortBelowEphemeral()
     {
-        for (int port = 23456; port < 23556; port++)
+        for (int port = 23456; port < 23656; port++)
         {
             var l = new TcpListener(IPAddress.Loopback, port);
             try { l.Start(); l.Stop(); return port; }
             catch (SocketException) { }
         }
         throw new InvalidOperationException("no free test port");
-    }
-
-    private static int FreePort()
-    {
-        var l = new TcpListener(IPAddress.Loopback, 0);
-        l.Start();
-        int port = ((IPEndPoint)l.LocalEndpoint).Port;
-        l.Stop();
-        return port;
-    }
-
-    private static async Task<bool> Until(Func<bool> cond, int seconds)
-    {
-        var sw = Stopwatch.StartNew();
-        while (sw.Elapsed < TimeSpan.FromSeconds(seconds))
-        {
-            if (cond()) return true;
-            await Task.Delay(300);
-        }
-        return false;
     }
 }

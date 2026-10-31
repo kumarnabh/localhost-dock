@@ -17,23 +17,47 @@ jobs:
 
       - uses: actions/setup-dotnet@v5
         with:
-          dotnet-version: 8.0.x
+          dotnet-version: 10.0.x
 
       - name: Build
         run: dotnet build -c Release
 
-      - name: Test
-        run: dotnet test -c Release --no-build
+      - name: Dependency vulnerability scan
+        shell: pwsh
+        run: |
+          $out = dotnet list package --vulnerable --include-transitive 2>&1 | Out-String
+          Write-Host $out
+          if ($out -match 'has the following vulnerable packages') { throw 'Vulnerable packages found.' }
 
-      - name: Publish single-file exe
-        run: >
-          dotnet publish src/LocalhostDock/LocalhostDock.csproj -c Release -r win-x64
-          --self-contained false -p:PublishSingleFile=true -o publish
+      # Includes the process-safety regression suite; a release can't be produced if it fails.
+      - name: Test (with coverage)
+        run: dotnet test -c Release --no-build --collect:"XPlat Code Coverage" --results-directory TestResults
+
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: test-results-and-coverage
+          path: TestResults/
+
+      - name: Publish (framework-dependent and self-contained)
+        shell: pwsh
+        run: |
+          dotnet publish src/LocalhostDock/LocalhostDock.csproj -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true -o publish/fd
+          dotnet publish src/LocalhostDock/LocalhostDock.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:EnableCompressionInSingleFile=true -o publish/sc
+          foreach ($d in 'fd', 'sc') {
+            $p = Start-Process "publish/$d/LocalhostDock.exe" -ArgumentList '--selftest' -PassThru -Wait
+            if ($p.ExitCode -ne 0) { throw "$d build failed its self-test ($($p.ExitCode))" }
+          }
 
       - uses: actions/upload-artifact@v6
         with:
           name: LocalhostDock-win-x64
-          path: publish/
+          path: publish/fd/
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: LocalhostDock-win-x64-selfcontained
+          path: publish/sc/
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
@@ -47,12 +71,21 @@ jobs:
           name: LocalhostDock-win-x64
           path: LocalhostDock
 
-      - name: Zip
-        run: zip -r "LocalhostDock-${GITHUB_REF_NAME}-win-x64.zip" LocalhostDock
+      - uses: actions/download-artifact@v6
+        with:
+          name: LocalhostDock-win-x64-selfcontained
+          path: LocalhostDock-selfcontained
+
+      - name: Zip and hash
+        run: |
+          zip -r "LocalhostDock-${GITHUB_REF_NAME}-win-x64.zip" LocalhostDock
+          (cd LocalhostDock-selfcontained && zip -r "../LocalhostDock-${GITHUB_REF_NAME}-win-x64-selfcontained.zip" .)
+          sha256sum LocalhostDock-*.zip > SHA256SUMS.txt
+          cat SHA256SUMS.txt
 
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
         run: >
-          gh release create "$GITHUB_REF_NAME" "LocalhostDock-${GITHUB_REF_NAME}-win-x64.zip"
+          gh release create "$GITHUB_REF_NAME" LocalhostDock-*.zip SHA256SUMS.txt
           --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes

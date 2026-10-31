@@ -21,7 +21,10 @@ internal sealed class TrayApp : ApplicationContext
     private Snapshot? _last;
     private bool _polling;
     private Color _iconColor = Color.Empty;
-    private Action? _balloonAction;
+    // The click action of the most recent toast, valid only while it can still be the one clicked.
+    private (Action? Action, DateTime Until) _balloon;
+    private FileSystemWatcher? _watcher;
+    private readonly System.Windows.Forms.Timer _reloadDebounce = new() { Interval = 600 };
 
     public TrayApp(string[] args)
     {
@@ -37,6 +40,8 @@ internal sealed class TrayApp : ApplicationContext
         _controller = new AppController(registry);
         _dock = new DockForm(_controller, PollNow);
         _dock.Added += what => Notify("Added to your dock", $"{what}. Click the tray icon to start it.", null);
+        _dock.OperationFinished += (who, message, ok) => Notify(who, message, _dock.ShowNearTray, ok ? ToolTipIcon.Info : ToolTipIcon.Warning);
+        _dock.RegistryReloadRequested += ReloadRegistry;
 
         var menu = DarkMenu.Create();
         menu.Opening += (_, _) => BuildMenu(menu);
@@ -48,7 +53,7 @@ internal sealed class TrayApp : ApplicationContext
             Visible = true,
         };
         _tray.MouseClick += (_, e) => { if (e.Button == MouseButtons.Left) _dock.Toggle(); };
-        _tray.BalloonTipClicked += (_, _) => { _balloonAction?.Invoke(); _balloonAction = null; };
+        _tray.BalloonTipClicked += (_, _) => OnBalloonClicked();
 
         _hotkey = new Hotkey(() => { if (_dock.Visible) _dock.Hide(); else _dock.ShowNearTray(); });
         if (_hotkey.Set(_controller.Registry.Hotkey) is { } hotkeyError)
@@ -58,7 +63,38 @@ internal sealed class TrayApp : ApplicationContext
         _timer.Tick += (_, _) => PollNow();
         _timer.Start();
         PollNow();
+        WatchRegistryFile();
+        ShowLoadWarnings(registry);
         _ = HandleArgsWhenReady(args);
+    }
+
+    private void ShowLoadWarnings(Registry registry)
+    {
+        if (registry.LoadWarnings.Count == 0) return;
+        Debug.WriteLine(string.Join(Environment.NewLine, registry.LoadWarnings));
+        Notify("apps.json was repaired",
+            registry.LoadWarnings.Count == 1 ? registry.LoadWarnings[0] : $"{registry.LoadWarnings[0]} (+{registry.LoadWarnings.Count - 1} more)",
+            OpenRegistryFile, ToolTipIcon.Warning);
+    }
+
+    /// <summary>Reload automatically when apps.json is edited outside the dock (e.g. in Notepad).</summary>
+    private void WatchRegistryFile()
+    {
+        try
+        {
+            _watcher = new FileSystemWatcher(Registry.Folder, "apps.json") { NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.FileName };
+            _watcher.Changed += (_, _) => _ui.Post(_ => { _reloadDebounce.Stop(); _reloadDebounce.Start(); }, null);
+            _watcher.Renamed += (_, _) => _ui.Post(_ => { _reloadDebounce.Stop(); _reloadDebounce.Start(); }, null);
+            _watcher.EnableRaisingEvents = true;
+            _reloadDebounce.Tick += (_, _) =>
+            {
+                _reloadDebounce.Stop();
+                bool changed;
+                lock (_controller.Registry.SyncRoot) changed = _controller.Registry.ChangedOnDisk();
+                if (changed) ReloadRegistry();
+            };
+        }
+        catch (Exception ex) { Debug.WriteLine(ex); }
     }
 
     // ================================================================ args (startup + forwarded from a second launch)
@@ -74,6 +110,11 @@ internal sealed class TrayApp : ApplicationContext
             if (args[i].Equals("--add", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
             {
                 _dock.AddFromPath(args[++i]);
+                return;
+            }
+            if (args[i].Equals("--exit", StringComparison.OrdinalIgnoreCase))
+            {
+                ExitThread();
                 return;
             }
             if (args[i].Equals("--show", StringComparison.OrdinalIgnoreCase))
@@ -96,6 +137,7 @@ internal sealed class TrayApp : ApplicationContext
             _last = snap;
             UpdateTray(snap);
             NotifyTransitions(snap);
+            RecordVerifiedStarts();
             _dock.Render(snap);
         }
         catch (Exception ex)
@@ -134,20 +176,26 @@ internal sealed class TrayApp : ApplicationContext
         foreach (var s in snap.Apps)
         {
             var app = s.App;
-            bool known = _previous.TryGetValue(app.Name, out var before);
-            _previous[app.Name] = s.State;
+            bool known = _previous.TryGetValue(app.Id, out var before);
+            _previous[app.Id] = s.State;
             if (!known || mode == "off") continue;
 
-            if (before == AppState.Up && s.State == AppState.Down && !_controller.StoppedByUser(app.Name))
+            // A crash: it was up, it's down, and the process exit wasn't something you asked for.
+            if (before == AppState.Up && s.State == AppState.Down && !_controller.StoppedByUser(app.Id))
             {
-                Notify($"{app.Name} went down",
-                    $":{app.Port} stopped listening and you didn't stop it." + (app.Start is not null ? " Click to restart." : ""),
+                string how = s.LastExit is { Code: int code } ? $"{s.LastExit.Process} exited with code {code}." : $":{app.Port} stopped listening.";
+                Notify($"{app.Name} went down", $"{how} You didn't stop it." + (app.Start is not null ? " Click to restart." : ""),
                     app.Start is not null ? () => _dock.Act(app, "start") : null, ToolTipIcon.Warning);
             }
             else if (before == AppState.Starting && s.State == AppState.Down)
             {
-                Notify($"{app.Name} didn't start", $"Nothing listened on :{app.Port} within 90 seconds. Click to view logs.",
+                Notify($"{app.Name} didn't start", (s.LastError ?? $"Nothing listened on :{app.Port}.") + " Click to view logs.",
                     () => LogViewer.ShowFor(app), ToolTipIcon.Warning);
+            }
+            else if (before is AppState.Down or AppState.Up && s.State == AppState.Conflict)
+            {
+                Notify($"{app.Name}: port :{app.Port} taken", $"{s.ForeignHolder?.Identity?.ToString() ?? "Another program"} is listening on it. Click for details.",
+                    _dock.ShowNearTray, ToolTipIcon.Warning);
             }
             else if (mode == "all" && before == AppState.Starting && s.State == AppState.Up)
             {
@@ -155,13 +203,46 @@ internal sealed class TrayApp : ApplicationContext
                     app.EffectiveUrl is not null ? () => _controller.Open(app) : null);
             }
         }
-        foreach (var gone in _previous.Keys.Where(k => _controller.Registry.Find(k) is null).ToList()) _previous.Remove(gone);
+        var ids = snap.Apps.Select(a => a.App.Id).ToHashSet();
+        foreach (var gone in _previous.Keys.Where(k => !ids.Contains(k)).ToList()) _previous.Remove(gone);
+    }
+
+    private void RecordVerifiedStarts()
+    {
+        var verified = _controller.TakeVerifiedStarts();
+        if (verified.Count == 0) return;
+        _controller.Mutate(r => { foreach (var id in verified) if (r.ById(id) is { } a) a.StartUnverified = false; });
+        TrySave();
     }
 
     private void Notify(string title, string text, Action? onClick, ToolTipIcon icon = ToolTipIcon.Info)
     {
-        _balloonAction = onClick;
+        // Windows shows one balloon at a time but keeps older ones in the notification center, and the click
+        // event doesn't say which one was clicked. If another toast is still "live", the click is ambiguous,
+        // so neither gets a specific action: clicking just opens the dock.
+        bool overlapping = DateTime.UtcNow < _balloon.Until;
+        _balloon = (overlapping ? null : onClick, DateTime.UtcNow.AddSeconds(8));
+        if (text.Length > 250) text = text[..247] + "…";
         _tray.ShowBalloonTip(5000, title, text, icon);
+    }
+
+    private void OnBalloonClicked()
+    {
+        var (action, until) = _balloon;
+        _balloon = (null, DateTime.MinValue);
+        // Clicked late (from the notification center) or ambiguous: the safe default is to show the dock.
+        if (action is not null && DateTime.UtcNow <= until) action();
+        else _dock.ShowNearTray();
+    }
+
+    private void TrySave()
+    {
+        try
+        {
+            lock (_controller.Registry.SyncRoot) _controller.Registry.Save();
+        }
+        catch (Config.RegistryConflictException) { ReloadRegistry(); }
+        catch (Exception ex) { Debug.WriteLine(ex); }
     }
 
     // ================================================================ tray menu
@@ -227,7 +308,8 @@ internal sealed class TrayApp : ApplicationContext
 
     private void OpenRegistryFile()
     {
-        _controller.Registry.Save();
+        // Don't save first: that could overwrite edits made outside the dock. The dock saves its own changes as
+        // they happen, and reloads automatically when the file is changed here.
         Process.Start(new ProcessStartInfo("notepad.exe", $"\"{Registry.FilePath}\"") { UseShellExecute = true });
     }
 
@@ -236,6 +318,7 @@ internal sealed class TrayApp : ApplicationContext
         try
         {
             _controller.Reload();
+            ShowLoadWarnings(_controller.Registry);
             _timer.Interval = _controller.Registry.PollMs;
             if (_hotkey.Set(_controller.Registry.Hotkey) is { } err) Notify("Shortcut not available", err, null, ToolTipIcon.Warning);
             _dock.ForceRebuild();
@@ -250,8 +333,8 @@ internal sealed class TrayApp : ApplicationContext
 
     private void SetNotifications(string mode)
     {
-        _controller.Registry.Notifications = mode;
-        _controller.Registry.Save();
+        _controller.Mutate(r => r.Notifications = mode);
+        TrySave();
     }
 
     private static bool IsAutostart()
@@ -277,7 +360,10 @@ internal sealed class TrayApp : ApplicationContext
     protected override void ExitThreadCore()
     {
         _timer.Stop();
+        _watcher?.Dispose();
+        _reloadDebounce.Dispose();
         _hotkey.Dispose();
+        _controller.Dispose();
         _tray.Visible = false;
         _tray.Dispose();
         _dock.Dispose();

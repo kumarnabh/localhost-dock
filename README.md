@@ -54,15 +54,15 @@ You can switch to crashes-only, or turn them off, in tray menu → *Settings*.
 
 **Your launchers stay yours.** Localhost Dock runs your existing `.cmd` files exactly as a double-click would, and never edits them.
 
-It's a single small .NET 8 WinForms executable. It has no background service, needs no admin rights and sends nothing over the network.
+It's a single small .NET 10 WinForms executable. It has no background service, needs no admin rights and sends nothing over the network.
 
 ## Install
 
-**Requirements:** Windows 10/11 and the [.NET 8 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/8.0) (the SDK too, if you build from source).
+**Requirements:** Windows 10/11 (x64). The *self-contained* download needs nothing else; the smaller one needs the [.NET 10 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/10.0). Building from source needs the .NET 10 SDK.
 
 ### From a release
 
-1. Download `LocalhostDock-<version>-win-x64.zip` from [Releases](../../releases).
+1. Download `LocalhostDock-<version>-win-x64-selfcontained.zip` (or the smaller `-win-x64.zip` if you have the .NET 10 Desktop Runtime) from [Releases](../../releases). `SHA256SUMS.txt` lists the hashes, so you can check the download with `Get-FileHash`.
 2. Unzip it anywhere and run `LocalhostDock.exe`.
 3. Optionally, right-click the tray icon → *Settings* and tick **Start with Windows** and **Explorer right-click: "Add to Localhost Dock"**.
 
@@ -71,10 +71,10 @@ It's a single small .NET 8 WinForms executable. It has no background service, ne
 ```powershell
 git clone https://github.com/kumarnabh/localhost-dock.git
 cd localhost-dock
-.\install.ps1            # publishes to %LOCALAPPDATA%\Programs\LocalhostDock, adds a Start Menu shortcut, starts it
+.\install.ps1            # build → self-test → swap in → start; rolls back automatically if the new version won't run
 ```
 
-`.\install.ps1 -Uninstall` removes it again, including the autostart and Explorer entries. Your `apps.json` is always left alone.
+Upgrading is safe to run over a working install. The new build is staged and self-tested *before* the running dock is stopped. The previous version is kept, and it comes back automatically if the new one doesn't stay up (or run `.\install.ps1 -Rollback` yourself). Other switches: `-SelfContained` bundles the runtime, and `-Uninstall` removes everything including the autostart and Explorer entries. Your `apps.json` is never touched.
 
 ## Quick reference
 
@@ -94,9 +94,10 @@ cd localhost-dock
 
 | Dot | State |
 | --- | --- |
-| 🟢 | Something is listening on the app's `port` |
-| 🔴 | Nothing is listening on it |
-| 🟠 | Starting or stopping: you clicked Start/Stop and the port hasn't changed yet (gives up after 90 s / 30 s) |
+| 🟢 | The app's own process is listening on its `port` (started by the dock, or running from the app's folder). *“owner unverified”* means something is listening but its details can't be read |
+| 🔴 | Not running. The subtitle says *crashed (exit code N)* or *failed: …* when it didn't go down by your hand |
+| 🟠 | **Port conflict:** another program holds the app's port. The subtitle names it; Start is blocked until the port is free |
+| 🟠 | Starting or stopping (subtitle says so): waiting for the port to open or close (start gives up after `startTimeoutSec`, 90 s by default) |
 | ⚪ | No `port` configured, so status can't be known |
 | 🔵 | A discovered port that isn't in your dock |
 
@@ -124,18 +125,26 @@ Every field, and exactly how Start and Stop behave, is covered in **[docs/CONFIG
 
 ## Safety
 
-- **Kill always asks first.** The confirmation shows the process name, PID, port and full command line, and defaults to *No*.
-- Kill ends the process **and its children** (`taskkill /T /F`), so an `npm run dev` doesn't leave an orphaned `node.exe` behind.
-- System processes (`System`, `svchost.exe`, `lsass.exe`, `services.exe`, …) and Localhost Dock itself can't be killed from the dock, and never appear under *Discovered*.
-- **Stop** on a registered app runs your `stop` command if you set one. If there isn't one, or the port is still held 5 seconds after it finishes, Stop kills whatever is listening on the app's ports, plus the console the dock started. That's the one place the dock kills without a second prompt, because the app row says exactly what it will stop.
+Stopping processes is the one dangerous thing this app does, so it's built around one rule: **never stop a process that isn't verifiably yours without asking.**
+
+- **Stop only touches the app's own processes.** A process counts as the app's if the dock started it (a verified descendant of the launch), or if its working directory, command line or executable is inside the app's folder. Anything else on the port (another project, a different server) is *not* stopped. Instead you see what it is and why it doesn't look like this app, and you choose, with **No** as the default.
+- **Every termination revalidates identity.** Processes are tracked by PID *and* creation time *and* executable path. Windows reuses PIDs, so a recycled PID never gets hit.
+- **Graceful first.** The app is asked to exit (window close and Ctrl+C) and is force-stopped only after `gracefulTimeoutSec`. Set `stopPolicy: "graceful-only"` for apps that must never be force-killed. Child processes go too, so an `npm run dev` doesn't leave an orphaned `node.exe`.
+- **Protected, always:** Windows system processes, services, Localhost Dock itself and the program that started it. They can't be stopped from the dock, even when Windows won't let it inspect them, and they never appear under *Discovered*.
+- **Kill** (Who's on port / Discovered) always asks first, showing the process, PID, port and command line.
+- **One operation at a time per app.** Restart only starts again once the stop is verified complete, and group stops go one app at a time, in reverse order.
+- **Your config is protected.** Edits made outside the dock are never overwritten. Every save keeps a backup, a corrupt `apps.json` is recovered from the newest good backup, and schema upgrades back up the original first.
 - Detection only *reads* your files. Nothing is saved until you press Save or Add.
 - Your registry and logs stay on your machine. Localhost Dock makes no network calls.
+
+These rules are covered by a dedicated safety test suite that CI runs before any release (see [docs/BACKLOG-STATUS.md](docs/BACKLOG-STATUS.md)).
 
 ## Docs
 
 - [Configuration reference](docs/CONFIGURATION.md)
 - [How it works](docs/ARCHITECTURE.md)
 - [Troubleshooting](docs/TROUBLESHOOTING.md)
+- [Upgrade backlog status](docs/BACKLOG-STATUS.md)
 - [Roadmap](ROADMAP.md) · [Changelog](CHANGELOG.md) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)
 
 ## License

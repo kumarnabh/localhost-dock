@@ -1,5 +1,26 @@
 # Roadmap
 
+Detailed status of the 110-item upgrade backlog: **[docs/BACKLOG-STATUS.md](docs/BACKLOG-STATUS.md)**.
+
+## v0.3: shipped (safety and correctness)
+
+- [x] Ownership-verified Stop: unrelated processes are never stopped without confirmation
+- [x] One guarded termination path: identity revalidation (PID reuse safe), protected processes, graceful → force, stop policies
+- [x] Serialized per-app operations; verified restart; sequential reverse group stop; group failure policies
+- [x] Crash detection with exit codes; port-conflict state
+- [x] Registry schema v2 with ids, migrations, normalization, backups, corruption recovery, conflict-safe saves
+- [x] Safe log capture (no shell redirection), rotation; hardened single-instance pipe
+- [x] .NET 10; staged installer with self-test and rollback; self-contained release; hashes; CI vulnerability gate
+
+## Next (batch 2: workspaces and health)
+
+- [ ] HTTP health/readiness checks (`health`), degraded state, latency
+- [ ] Workspace profiles, dependency graphs, session restore
+- [ ] Port-conflict wizard (reassign / free the port)
+- [ ] Auto-restart with back-off and crash-loop protection
+- [ ] Machine-readable CLI (`status --json`) and a read-only MCP interface
+- [ ] Per-monitor DPI v2, keyboard navigation, light theme
+
 ## v0.2: shipped
 
 - [x] **Smart add:** drop a launcher or project folder; name, port(s), URL, start/stop and working directory are detected (launchers + the scripts they call, npm/pnpm/yarn/bun projects, monorepo `dev:*` scripts, Vite/Next/Astro/… defaults, Django)
@@ -21,9 +42,7 @@
 
 ## Next
 
-- [ ] Optional HTTP health check (`"health": "/healthz"`) for apps that listen before they're ready
 - [ ] Per-app environment variables and "open URL after start"
-- [ ] Restart automatically after a crash (opt-in, with back-off)
 - [ ] Drag to reorder rows
 - [ ] Light theme following the Windows setting
 

@@ -16,6 +16,10 @@ internal sealed class AppEditor : Form
     private readonly TextBox _source, _name, _port, _extra, _url, _start, _stop, _cwd, _logFile;
     private readonly ComboBox _window, _candidates;
     private readonly CheckBox _capture;
+    private readonly ComboBox _stopPolicy;
+    private readonly NumericUpDown _grace;
+    private readonly string? _originalStart;
+    private int _detectGeneration;
     private readonly Label _detectNote, _portNote;
     private readonly System.Windows.Forms.Timer _debounce = new() { Interval = 350 };
     private List<Detection> _found = new();
@@ -23,6 +27,7 @@ internal sealed class AppEditor : Form
     public AppEditor(AppEntry app, Registry registry, string title, string? detectFrom = null, string? note = null)
     {
         _app = app;
+        _originalStart = app.Start;
         _registry = registry;
         Text = title;
         FormBorderStyle = FormBorderStyle.FixedDialog;
@@ -96,6 +101,21 @@ internal sealed class AppEditor : Form
 
         _logFile = Field(grid, "Log file", app.LogFile ?? "", "optional: a log your app already writes", browse: true, filter: "Logs|*.log;*.txt|All files|*.*");
 
+        Caption(grid, "Stop policy");
+        _stopPolicy = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = S(300) };
+        _stopPolicy.Items.AddRange(new object[]
+        {
+            "graceful: ask it to exit, force after the timeout",
+            "graceful-only: never force-kill",
+            "force: stop immediately",
+        });
+        _stopPolicy.SelectedIndex = app.StopPolicy switch { "graceful-only" => 1, "force" => 2, _ => 0 };
+        _grace = new NumericUpDown { Minimum = 1, Maximum = 300, Value = Math.Clamp(app.GracefulTimeoutSec, 1, 300), Width = S(60) };
+        var policyRow = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Margin = Padding.Empty };
+        policyRow.Controls.AddRange(new Control[] { _stopPolicy, new Label { Text = "timeout (s)", AutoSize = true, ForeColor = Muted, Margin = new Padding(S(10), S(6), S(4), 0) }, _grace });
+        grid.Controls.Add(policyRow);
+        grid.Controls.Add(Filler());
+
         // ---- buttons
         var save = Theme.Button("Save", (_, _) => Save(), primary: true);
         var cancel = Theme.Button("Cancel", (_, _) => { DialogResult = DialogResult.Cancel; });
@@ -127,7 +147,7 @@ internal sealed class AppEditor : Form
 
     // ---------------------------------------------------------------- detection
 
-    private void RunDetection()
+    private async void RunDetection()
     {
         string path = _source.Text.Trim().Trim('"');
         if (path.Length == 0) return;
@@ -137,9 +157,16 @@ internal sealed class AppEditor : Form
             return;
         }
 
+        // Detection reads files (and follows script references), so keep it off the UI thread.
+        int generation = ++_detectGeneration;
         UseWaitCursor = true;
-        try { _found = AppDetector.Detect(path); }
+        _detectNote.Text = "Detecting…";
+        List<Detection> found;
+        try { found = await Task.Run(() => AppDetector.Detect(path)); }
+        catch (Exception ex) { found = new(); _detectNote.Text = $"Detection failed: {ex.Message}"; }
         finally { UseWaitCursor = false; }
+        if (generation != _detectGeneration || IsDisposed) return; // a newer path was typed meanwhile
+        _found = found;
 
         _candidates.Items.Clear();
         _candidates.Visible = _found.Count > 1;
@@ -159,6 +186,7 @@ internal sealed class AppEditor : Form
     {
         var a = d.App;
         _name.Text = _registry.UniqueName(a.Name, _app);
+        _app.StartUnverified = a.StartUnverified;
         _port.Text = a.Port?.ToString() ?? "";
         _extra.Text = string.Join(", ", a.ExtraPorts);
         _url.Text = a.Url ?? "";
@@ -176,7 +204,7 @@ internal sealed class AppEditor : Form
             _portNote.Text = "";
             return;
         }
-        var other = _registry.Apps.FirstOrDefault(a => a != _app && a.AllPorts.Contains(port));
+        var other = _registry.Apps.FirstOrDefault(a => a.Id != _app.Id && a.AllPorts.Contains(port));
         var holder = PortTable.GetListeners().FirstOrDefault(l => l.Port == port);
         if (other is not null)
             (_portNote.Text, _portNote.ForeColor) = ($"⚠ also used by {other.Name}", Pending);
@@ -194,7 +222,7 @@ internal sealed class AppEditor : Form
     {
         if (string.IsNullOrWhiteSpace(_name.Text)) { Warn("Give the app a name."); return; }
         string name = _name.Text.Trim();
-        if (_registry.Apps.Any(a => a != _app && a.Name.Equals(name, StringComparison.OrdinalIgnoreCase)))
+        if (_registry.Apps.Any(a => a.Id != _app.Id && a.Name.Equals(name, StringComparison.OrdinalIgnoreCase)))
         { Warn($"There's already an app called “{name}”."); return; }
 
         int? port = null;
@@ -218,9 +246,6 @@ internal sealed class AppEditor : Form
                 return;
         }
 
-        if (_app.Name.Length > 0 && !_app.Name.Equals(name, StringComparison.OrdinalIgnoreCase))
-            _registry.Rename(_app.Name, name);
-
         _app.Name = name;
         _app.Port = port;
         _app.ExtraPorts = extra;
@@ -231,6 +256,10 @@ internal sealed class AppEditor : Form
         _app.Window = (string)_window.SelectedItem!;
         _app.CaptureLogs = _capture.Checked;
         _app.LogFile = NullIfBlank(_logFile.Text);
+        _app.StopPolicy = _stopPolicy.SelectedIndex switch { 1 => "graceful-only", 2 => "force", _ => "graceful" };
+        _app.GracefulTimeoutSec = (int)_grace.Value;
+        // Editing the start command by hand counts as reviewing it.
+        if (!string.Equals(_app.Start, _originalStart, StringComparison.Ordinal)) _app.StartUnverified = false;
         DialogResult = DialogResult.OK;
     }
 
