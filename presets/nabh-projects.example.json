@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 3,
+  "apps": [
+    { "id": "aura", "name": "Aura", "port": 4780, "start": "C:\\Aura - Command Center\\Start Aura.cmd", "cwd": "C:\\Aura - Command Center", "health": "/api/health", "window": "hidden" },
+    { "id": "assetlab", "name": "AssetLab", "port": 8765, "start": "C:\\Gaming-Studio-dev\\AssetLab\\Start-AssetLab.cmd", "cwd": "C:\\Gaming-Studio-dev\\AssetLab", "health": "/api/status", "window": "hidden" },
+    { "id": "vyora-web", "name": "Vyora web", "port": 3001, "start": "npm run dev", "cwd": "C:\\VyoraSuite\\apps\\web-app", "captureLogs": true },
+    { "id": "vyora-marketing", "name": "Vyora marketing", "port": 3000, "start": "npm run dev", "cwd": "C:\\VyoraSuite\\apps\\marketing-site", "captureLogs": true },
+    { "id": "nnplays", "name": "NNPlays preview", "port": 8088, "start": "npm run preview", "cwd": "C:\\Gaming-Studio-dev\\nnplays", "captureLogs": true }
+  ],
+  "workspaces": [
+    { "id": "tools", "name": "Local tools", "apps": ["aura", "assetlab"] },
+    { "id": "vyora", "name": "Vyora development", "apps": ["vyora-web", "vyora-marketing"] },
+    { "id": "games", "name": "NNPlays development", "apps": ["nnplays"] }
+  ]
+}

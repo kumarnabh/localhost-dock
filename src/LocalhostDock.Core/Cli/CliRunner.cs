@@ -57,7 +57,7 @@ public static partial class CliRunner
     public sealed record ProcessJson(int Pid, string Name, string Address, int Port, Ownership Ownership);
     public sealed record AppJson(string Id, string Name, AppState State, int? Port, IReadOnlyList<int> ExtraPorts, string? Url,
         IReadOnlyList<ProcessJson> Processes, double? UptimeSec, long MemoryBytes, HealthJson? Health, double? LastStartSec,
-        string? LastError, int? LastExitCode, bool? LastExitExpected, bool StartUnverified);
+        string? LastError, int? LastExitCode, bool? LastExitExpected, bool StartUnverified, bool Ready, int RecoverableProcesses);
     public sealed record WorkspaceJson(string Id, string Name, int Ready, int Total, IReadOnlyList<string> Apps, IReadOnlyList<string> NotReady);
     public sealed record StatusJson(string Schema, DateTime GeneratedAt, IReadOnlyList<AppJson> Apps, IReadOnlyList<WorkspaceJson> Workspaces);
 
@@ -81,11 +81,11 @@ public static partial class CliRunner
             s.MemoryBytes,
             s.Health is { } h ? new HealthJson(h.Healthy, h.Last?.Status, h.Last is null ? null : Math.Round(h.Last.LatencyMs, 1), h.Last?.Error, h.ConsecutiveFailures, Math.Round(h.Availability, 3)) : null,
             s.LastStartDuration?.TotalSeconds is double d ? Math.Round(d, 1) : null,
-            s.LastError, s.LastExit?.Code, s.LastExit?.Expected, s.App.StartUnverified)).ToList();
+            s.LastError, s.LastExit?.Code, s.LastExit?.Expected, s.App.StartUnverified, s.Ready, s.RecoverableProcesses)).ToList();
 
         var workspaces = snap.Workspaces.Select(w => new WorkspaceJson(w.Workspace.Id, w.Workspace.Name, w.Up, w.Members.Count,
             w.Members.Select(m => m.App.Name).ToList(),
-            w.Members.Where(m => m.State != AppState.Up).Select(m => m.App.Name).ToList())).ToList();
+            w.Members.Where(m => !m.Ready).Select(m => m.App.Name).ToList())).ToList();
 
         return new StatusJson("localhost-dock/status@1", DateTime.UtcNow, apps, workspaces);
     }

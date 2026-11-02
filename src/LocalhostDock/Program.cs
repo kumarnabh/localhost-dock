@@ -45,6 +45,8 @@ internal static class Program
             if (Net.ProcessIdentity.Capture(Environment.ProcessId) is null) return 2;
             string example = Path.Combine(AppContext.BaseDirectory, "apps.example.json");
             if (!File.Exists(example)) return 3;
+            if (!File.Exists(Path.Combine(AppContext.BaseDirectory, "integrations", "aura", "localhost-dock.mjs")) ||
+                !File.Exists(Path.Combine(AppContext.BaseDirectory, "presets", "nabh-projects.example.json"))) return 4;
             using var doc = System.Text.Json.JsonDocument.Parse(File.ReadAllText(example),
                 new System.Text.Json.JsonDocumentOptions { CommentHandling = System.Text.Json.JsonCommentHandling.Skip, AllowTrailingCommas = true });
             using var icon = UI.Theme.TrayIcon(UI.Theme.Up);

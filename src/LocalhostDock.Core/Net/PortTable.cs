@@ -34,14 +34,23 @@ public static class PortTable
     private static void Read(int family, List<Listener> into)
     {
         int size = 0;
-        GetExtendedTcpTable(IntPtr.Zero, ref size, true, family, TCP_TABLE_OWNER_PID_LISTENER, 0);
+        uint code = GetExtendedTcpTable(IntPtr.Zero, ref size, true, family, TCP_TABLE_OWNER_PID_LISTENER, 0);
+        if (family == AF_INET6 && code == 50) return; // IPv6 disabled on this machine
+        if (code is not (0 or 122)) throw new System.ComponentModel.Win32Exception((int)code, "Couldn't read TCP listeners; port status is unknown.");
         if (size == 0) return;
 
         IntPtr buffer = Marshal.AllocHGlobal(size);
         try
         {
-            if (GetExtendedTcpTable(buffer, ref size, true, family, TCP_TABLE_OWNER_PID_LISTENER, 0) != 0)
-                return;
+            // A server can bind between sizing and reading. Resize rather than reporting an empty table.
+            for (int attempt = 0; ; attempt++)
+            {
+                code = GetExtendedTcpTable(buffer, ref size, true, family, TCP_TABLE_OWNER_PID_LISTENER, 0);
+                if (code == 0) break;
+                if (code != 122 || attempt >= 3)
+                    throw new System.ComponentModel.Win32Exception((int)code, "Couldn't read TCP listeners; port status is unknown.");
+                buffer = Marshal.ReAllocHGlobal(buffer, (IntPtr)size);
+            }
 
             int count = Marshal.ReadInt32(buffer);
             IntPtr row = buffer + 4;

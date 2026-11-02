@@ -36,7 +36,10 @@ internal sealed class ConflictWizard : Form
         var col = new FlowLayoutPanel { FlowDirection = FlowDirection.TopDown, AutoSize = true, WrapContents = false, MaximumSize = new Size(S(600), 0) };
 
         // ---- who holds it
-        var listener = PortTable.GetListeners().FirstOrDefault(l => l.Port == port);
+        // Split IPv4/IPv6 bindings may have different owners. Never select the app's own binding
+        // as the foreign holder merely because it appears first in the TCP table.
+        var listener = PortTable.GetListeners().FirstOrDefault(l => l.Port == port &&
+            controller.Classify(app, l).Ownership is Ownership.Foreign or Ownership.Unverified);
         var details = listener is null ? null : ProcessInfo.Get(listener.Pid, fresh: true);
         Holder = details?.Identity;
         string? cwd = listener is null ? null : ProcessCwd.TryGet(listener.Pid);

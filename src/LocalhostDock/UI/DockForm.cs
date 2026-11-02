@@ -29,6 +29,8 @@ internal sealed class DockForm : Form
     private DateTime _hiddenAt;
     private int _modal;
     private Rectangle _area;
+    private string? _workspaceScope;
+    private int _resultIndex;
 
     public DockForm(AppController controller, Action requestPoll)
     {
@@ -73,14 +75,14 @@ internal sealed class DockForm : Form
         // WinForms hides PlaceholderText while the box has focus (it always does here), so draw our own hint.
         var hint = new Label
         {
-            Text = "Search…   Enter opens  ·  Ctrl+N adds  ·  or drop a launcher / folder here",
+            Text = "Search apps / workspaces…  ↑↓ selects · Enter opens · Esc goes back",
             ForeColor = Color.FromArgb(105, 110, 120), BackColor = Input, Font = Small, AutoSize = false,
             TextAlign = ContentAlignment.MiddleLeft, Cursor = Cursors.IBeam, UseMnemonic = false,
         };
         hint.Click += (_, _) => _search.Focus();
         _search.Controls.Add(hint);
         _search.Resize += (_, _) => hint.Bounds = new Rectangle(S(4), 0, _search.ClientSize.Width - S(8), _search.ClientSize.Height);
-        _search.TextChanged += (_, _) => { hint.Visible = _search.TextLength == 0; ApplyFilter(); };
+        _search.TextChanged += (_, _) => { hint.Visible = _search.TextLength == 0; _resultIndex = 0; ApplyFilter(); };
         searchBar.Controls.Add(_search);
 
         // ---- list
@@ -124,7 +126,13 @@ internal sealed class DockForm : Form
 
         KeyDown += (_, e) =>
         {
-            if (e.KeyCode == Keys.Escape) { if (_search.TextLength > 0) _search.Clear(); else Hide(); }
+            if (e.KeyCode == Keys.Escape)
+            {
+                e.SuppressKeyPress = true;
+                if (_search.TextLength > 0) _search.Clear();
+                else if (_workspaceScope is not null) NavigateWorkspace(null);
+                else Hide();
+            }
             else if (e.Control && e.KeyCode == Keys.F) { _search.Focus(); e.SuppressKeyPress = true; }
             else if (e.Control && e.KeyCode == Keys.N) { AddApp(); e.SuppressKeyPress = true; }
         };
@@ -210,6 +218,7 @@ internal sealed class DockForm : Form
             if (_rows.TryGetValue(s.App.Id, out var row)) row.Update(s);
         foreach (var w in snap.Workspaces)
             if (_workspaceRows.TryGetValue(w.Workspace.Id, out var row)) row.Update(w);
+        ApplyFilter();
     }
 
     private void Rebuild(Snapshot snap)
@@ -283,10 +292,18 @@ internal sealed class DockForm : Form
     private void ApplyFilter()
     {
         string q = _search.Text.Trim();
+        var workspace = _last?.Workspaces.FirstOrDefault(w => w.Workspace.Id == _workspaceScope);
+        if (_workspaceScope is not null && workspace is null) _workspaceScope = null;
+        if (workspace is not null) _summary.Text = workspace.Workspace.Name + " · Esc returns to all projects";
         _filteredOut.Clear();
         var controls = _list.Controls.Cast<Control>().ToList();
         foreach (var c in controls)
-            if (c is IFilterable f && q.Length > 0 && !f.Matches(q)) _filteredOut.Add(c);
+        {
+            bool outside = workspace is not null && (c is not AppRow appRow || !workspace.Workspace.Apps.Contains(appRow.App.Id));
+            bool matchesWorkspace = c is AppRow a && _last?.Workspaces.Any(w => w.Workspace.Apps.Contains(a.App.Id) &&
+                DockSearch.Matches(q, w.Workspace.Name)) == true;
+            if (outside || c is IFilterable f && q.Length > 0 && !f.Matches(q) && !matchesWorkspace) _filteredOut.Add(c);
+        }
 
         // Hide section headers whose rows are all filtered out.
         for (int i = 0; i < controls.Count; i++)
@@ -299,15 +316,45 @@ internal sealed class DockForm : Form
         _list.SuspendLayout();
         foreach (var c in controls) c.Visible = !_filteredOut.Contains(c);
         _list.ResumeLayout();
+        SelectSearchResult(scroll: false);
         if (Visible) FitToContent();
     }
 
     private void SearchKeyDown(object? sender, KeyEventArgs e)
     {
+        if (e.KeyCode is Keys.Up or Keys.Down)
+        {
+            e.SuppressKeyPress = true;
+            int count = SearchResults().Count;
+            if (count > 0) _resultIndex = (_resultIndex + (e.KeyCode == Keys.Down ? 1 : count - 1)) % count;
+            SelectSearchResult();
+            return;
+        }
         if (e.KeyCode != Keys.Enter) return;
         e.SuppressKeyPress = true;
-        var first = _list.Controls.OfType<AppRow>().FirstOrDefault(r => r.Visible);
-        if (first is not null) Act(first.App, "open");
+        var results = SearchResults();
+        if (results.Count == 0) return;
+        if (results[_resultIndex] is AppRow app) Act(app.App, "open");
+        else if (results[_resultIndex] is WorkspaceRow workspace) NavigateWorkspace(workspace.Workspace.Id);
+    }
+
+    private List<HoverRow> SearchResults() => _list.Controls.OfType<HoverRow>().Where(r => r is AppRow or WorkspaceRow && !_filteredOut.Contains(r)).ToList();
+
+    private void SelectSearchResult(bool scroll = true)
+    {
+        var results = SearchResults();
+        _resultIndex = Math.Clamp(_resultIndex, 0, Math.Max(0, results.Count - 1));
+        foreach (var row in _list.Controls.OfType<HoverRow>()) row.SelectResult(results.Count > 0 && row == results[_resultIndex]);
+        if (scroll && Visible && results.Count > 0) _list.ScrollControlIntoView(results[_resultIndex]);
+    }
+
+    internal void NavigateWorkspace(string? id)
+    {
+        _workspaceScope = id;
+        _resultIndex = 0;
+        _search.Clear();
+        if (_last is { } snapshot) Render(snapshot);
+        _search.Focus();
     }
 
     // ================================================================ adding apps
@@ -320,10 +367,26 @@ internal sealed class DockForm : Form
         menu.Items.Add(DarkMenu.Item("Scan a folder for apps…", () => ScanFolder()));
         menu.Items.Add(new ToolStripSeparator());
         menu.Items.Add(DarkMenu.Item("New workspace…", () => EditWorkspace(null)));
+        menu.Items.Add(DarkMenu.Item("Import workspace presets…", ImportPresets));
         menu.Show(_addButton, new Point(0, _addButton.Height));
     }
 
     private void AddApp() => OpenEditor(new AppEntry(), "Add app", detectFrom: null, note: null, isNew: true);
+
+    private void ImportPresets()
+    {
+        using var picker = new OpenFileDialog { Title = "Choose workspace presets", Filter = "Workspace presets|*.json", InitialDirectory = AppContext.BaseDirectory };
+        if (ShowModal(() => picker.ShowDialog(OwnerOrNull())) != DialogResult.OK) return;
+        try
+        {
+            var source = Workspace.WorkspacePresets.Read(picker.FileName);
+            using var review = new PresetImportDialog(source);
+            if (ShowModal(() => review.ShowDialog(OwnerOrNull())) != DialogResult.OK) return;
+            _controller.Mutate(r => Workspace.WorkspacePresets.Import(r, source, review.Selected));
+            SaveAndRefresh();
+        }
+        catch (Exception ex) { ShowModal(() => MessageBox.Show(this, ex.Message, "Could not import presets", MessageBoxButtons.OK, MessageBoxIcon.Warning)); }
+    }
 
     public void PickAndAdd()
     {
@@ -598,6 +661,12 @@ internal sealed class DockForm : Form
         OperationResult result;
         try
         {
+            if (action == "start")
+            {
+                List<AppEntry> unverified;
+                lock (_controller.Registry.SyncRoot) unverified = ws.Apps.Select(_controller.Registry.ById).Where(a => a?.StartUnverified == true).Select(a => a!.Clone()).ToList();
+                foreach (var app in unverified) if (!ConfirmUnverifiedStart(app)) return;
+            }
             result = action == "start"
                 ? await _controller.StartWorkspaceAsync(ws, _ => _requestPoll())
                 : await _controller.StopWorkspaceAsync(ws, ConfirmForeignStop);
@@ -675,6 +744,9 @@ internal sealed class DockForm : Form
     {
         var app = Live(shown);
         if (app?.Port is not int port) return;
+        var conflict = PortTable.GetListeners().Where(l => app.AllPorts.Contains(l.Port))
+            .FirstOrDefault(l => _controller.Classify(app, l).Ownership is Ownership.Foreign or Ownership.Unverified);
+        if (conflict is not null) port = conflict.Port;
         using var wizard = new ConflictWizard(app, port, _controller.Registry, _controller);
         if (ShowModal(() => wizard.ShowDialog(OwnerOrNull())) != DialogResult.OK) return;
 
@@ -696,7 +768,10 @@ internal sealed class DockForm : Form
                 _controller.Mutate(r =>
                 {
                     if (r.ById(app.Id) is not { } live) return;
-                    live.Port = wizard.NewPort;
+                    if (live.Port == port) live.Port = wizard.NewPort;
+                    else live.ExtraPorts = live.ExtraPorts.Select(p => p == port ? wizard.NewPort : p).ToList();
+                    if (Uri.TryCreate(live.Health, UriKind.Absolute, out var health) && health.Port == port)
+                        live.Health = new UriBuilder(health) { Port = wizard.NewPort }.Uri.AbsoluteUri;
                     if (wizard.NewStart is not null) live.Start = wizard.NewStart;
                     if (wizard.NewUrl is not null) live.Url = wizard.NewUrl;
                 });

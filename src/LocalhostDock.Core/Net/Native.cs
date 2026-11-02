@@ -44,6 +44,9 @@ internal static class Native
     public static extern bool AttachConsole(uint pid);
 
     [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern uint GetConsoleProcessList([Out] uint[] processList, uint processCount);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool FreeConsole();
 
     [DllImport("kernel32.dll")]

@@ -2,6 +2,7 @@ using System.Security.Cryptography;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using LocalhostDock.Net;
+using LocalhostDock.Integration;
 
 namespace LocalhostDock.Config;
 
@@ -83,8 +84,7 @@ public sealed class AppEntry
         get
         {
             if (!string.IsNullOrWhiteSpace(Cwd) && Directory.Exists(Cwd)) return Path.GetFullPath(Cwd);
-            string? start = Start?.Trim().Trim('"');
-            return start is not null && File.Exists(start) ? Path.GetDirectoryName(Path.GetFullPath(start)) : null;
+            return !string.IsNullOrWhiteSpace(Start) ? Core.Launcher.Build(Start, Cwd).DefaultCwd : null;
         }
     }
 
@@ -159,6 +159,9 @@ public sealed class Registry
     public List<AppEntry> Apps { get; set; } = new();
 
     public List<WorkspaceEntry> Workspaces { get; set; } = new();
+
+    /// <summary>Opt-in, authenticated, read-only loopback status for Aura. Port 0 selects a free port.</summary>
+    public AuraOptions Aura { get; set; } = new();
 
     /// <summary>Schema 1–2 "groups" (ordered lists). Read only to migrate them into workspaces; never written.</summary>
     [JsonPropertyName("groups")]
@@ -261,6 +264,13 @@ public sealed class Registry
         Workspaces ??= new();
         IgnoredPorts ??= new();
         ScanFolders ??= new();
+        Aura ??= new();
+        if (Aura.Port is < 0 or > 65535)
+        {
+            Aura.Enabled = false;
+            Aura.Port = 0;
+            notes.Add("Aura status was disabled because its port is invalid (0–65535).");
+        }
 
         int removed = Apps.RemoveAll(a => a is null || string.IsNullOrWhiteSpace(a.Name));
         if (removed > 0) notes.Add($"Removed {removed} app entr{(removed == 1 ? "y" : "ies")} without a name.");
@@ -470,7 +480,7 @@ public sealed class Registry
         return reg;
     }
 
-    private static Registry Parse(string text)
+    internal static Registry Parse(string text)
     {
         // Files from v0.1/v0.2 have no schemaVersion: treat that as 1.
         using (var doc = JsonDocument.Parse(text, new JsonDocumentOptions { CommentHandling = JsonCommentHandling.Skip, AllowTrailingCommas = true }))

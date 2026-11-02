@@ -7,9 +7,11 @@ Localhost Dock runs commands from your own `apps.json` and can terminate process
 - Killing a process from *Discovered* or *Who's on this port?* always needs confirmation.
 - The single-instance pipe only accepts the same Windows user, limits message size and accepts only known arguments.
 - It doesn't need admin rights, and it can't affect elevated processes.
-- It makes no network requests, and your registry never leaves your machine.
+- Health checks connect only to loopback and never follow redirects or use proxies. The optional Aura status listener also binds only to loopback, requires a rotating bearer token, rejects browser origins, and exposes an allowlist with no control routes. See [Aura security and contract](docs/AURA.md).
 
 Treat `apps.json` like a script: anyone who can write to it can make Start run a command as you.
+
+Treat workspace presets like scripts too: review their commands before import and first use. Keep `apps.json` and `aura-endpoint.json` in your private Windows profile. Same-user programs can read those files; the status interface is not a sandbox against a compromised local account. Never expose discovery credentials in browser bundles, LAN routes, logs or commits.
 
 ## Reporting a vulnerability
 

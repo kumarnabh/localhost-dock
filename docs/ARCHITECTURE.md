@@ -1,6 +1,6 @@
 # How it works
 
-Localhost Dock is a WinForms tray app plus a read-only CLI, both on one engine library (.NET 10). It has no service and needs no admin rights. Its only network traffic is the health checks you configure, and those reach this machine only.
+Localhost Dock is a WinForms tray app plus a read-only CLI, both on one engine library (.NET 10). It has no service and needs no admin rights. Network traffic is restricted to configured local health checks and the opt-in loopback Aura status interface. See [Aura's contract](AURA.md).
 
 ```
 src/LocalhostDock.Core/              the engine (no UI): used by the app, the CLI and the tests
@@ -46,11 +46,15 @@ src/ldock/                           thin console host for CliRunner
 
 `HealthMonitor` runs each app's check in the background at its interval, but only while the app's own process holds its port. Each check is a `GET` with its own timeout. It uses no proxy and follows no redirects (3xx counts as healthy, but never leads off-machine). `localhost` is connected on IPv4 and IPv6 at once, and the first to answer wins. That avoids Windows' slow IPv6-first fallback when a dev server bound only `127.0.0.1`. The last 120 samples are kept per app.
 
-**Ready** means listening *and* healthy (when a check is configured). It's what settles a Start, what `StartAndWaitAsync` waits for, and what workspace dependents wait on. A running app whose last two checks failed is **degraded**. Every start records its time-to-ready.
+**Ready** means verified ownership of every primary binding *and* healthy (when configured), with no foreign secondary binding. Unverified ownership never satisfies readiness. Health state resets on listener identity or health target changes, and each probe uses a fresh connection. Ready settles a Start and gates workspace dependents. Two failed checks make a running app **degraded**. Every start records its time-to-ready.
 
 ## Workspaces
 
-`WorkspacePlan.Levels` is Kahn's algorithm, with member order breaking ties. `StartWorkspaceAsync` doesn't run level by level. It starts each member *as soon as* everything it depends on is ready, with at most `maxParallel` in flight. When a member fails, its transitive dependents are marked "not started". With `onFailure: "stop"`, nothing new is launched at all; in-flight starts are allowed to finish. `StopWorkspaceAsync` walks the reverse order one app at a time through the normal ownership-checked Stop.
+`WorkspacePlan.Levels` is Kahn's algorithm, with member order breaking ties. `StartWorkspaceAsync` starts each member as soon as its dependencies are ready, with at most `maxParallel` in flight. Failed dependencies block their dependents. With `onFailure: "stop"`, nothing new launches; in-flight starts finish. The app gate remains held for the full readiness wait. Stops walk reverse dependency order one app at a time. A failed stop preserves that member's prerequisites.
+
+`WorkspacePresets` imports selected workspaces from registry-shaped JSON, remapping IDs, reusing matching services and preserving configuration. New commands are unverified and require first-use confirmation. The review dialog shows commands before saving; import has no lifecycle effects.
+
+`Integration/AuraStatusServer` takes published snapshots rather than a controller reference. It binds an exclusive `TcpListener` to 127.0.0.1, implements bounded one-request HTTP, authenticates per-start credentials and serializes allowlisted `AuraStatus` records. Tray startup/reload/exit owns its lifetime. Poll failures invalidate the cache. HTTP requests cannot invoke controller methods. The Node adapter in `integrations/aura` is tested against the Windows server.
 
 Session restore builds a temporary workspace from the apps to restore (`WorkspacePlan.Combine`). It keeps only the dependencies your workspaces declare between those apps, so a restore starts things in a sensible order.
 

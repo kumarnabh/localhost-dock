@@ -17,6 +17,8 @@ internal sealed class TrayApp : ApplicationContext
     private readonly DockForm _dock;
     private readonly System.Windows.Forms.Timer _timer;
     private readonly Hotkey _hotkey;
+    private AuraStatusServer? _aura;
+    private int? _auraPort;
     private readonly SynchronizationContext _ui;
     private readonly Dictionary<string, AppState> _previous = new(StringComparer.OrdinalIgnoreCase);
     private Snapshot? _last;
@@ -69,6 +71,7 @@ internal sealed class TrayApp : ApplicationContext
         _timer = new System.Windows.Forms.Timer { Interval = _controller.Registry.PollMs };
         _timer.Tick += (_, _) => PollNow();
         _timer.Start();
+        ConfigureAura();
         PollNow();
         WatchRegistryFile();
         ShowLoadWarnings(registry);
@@ -142,6 +145,7 @@ internal sealed class TrayApp : ApplicationContext
         {
             var snap = await Task.Run(_controller.Poll);
             _last = snap;
+            _aura?.Publish(snap);
             UpdateTray(snap);
             NotifyTransitions(snap);
             RecordVerifiedStarts();
@@ -152,6 +156,7 @@ internal sealed class TrayApp : ApplicationContext
         }
         catch (Exception ex)
         {
+            _aura?.Invalidate();
             Debug.WriteLine(ex);
         }
         finally
@@ -312,6 +317,15 @@ internal sealed class TrayApp : ApplicationContext
         explorer.Checked = ExplorerMenu.IsInstalled();
         settings.DropDownItems.Add(autostart);
         settings.DropDownItems.Add(explorer);
+        var aura = DarkMenu.Item("Aura: read-only localhost status", () =>
+        {
+            _controller.Mutate(r => r.Aura.Enabled = !r.Aura.Enabled);
+            TrySave();
+            ConfigureAura();
+            PollNow();
+        });
+        aura.Checked = _aura is not null;
+        settings.DropDownItems.Add(aura);
         settings.DropDownItems.Add(new ToolStripSeparator());
         foreach (var (mode, label) in new[] { ("all", "Notify: crashes and starts"), ("crashes", "Notify: crashes only"), ("off", "Notify: off") })
         {
@@ -346,6 +360,7 @@ internal sealed class TrayApp : ApplicationContext
         try
         {
             _controller.Reload();
+            ConfigureAura();
             ShowLoadWarnings(_controller.Registry);
             _timer.Interval = _controller.Registry.PollMs;
             if (_hotkey.Set(_controller.Registry.Hotkey) is { } err) Notify("Shortcut not available", err, null, ToolTipIcon.Warning);
@@ -368,7 +383,7 @@ internal sealed class TrayApp : ApplicationContext
     private static bool IsAutostart()
     {
         using var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(RunKey);
-        return key?.GetValue(RunValue) is string;
+        return WindowsStartup.Matches(key?.GetValue(RunValue), Environment.ProcessPath!);
     }
 
     private static void ToggleAutostart()
@@ -376,7 +391,30 @@ internal sealed class TrayApp : ApplicationContext
         using var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(RunKey, writable: true)
                         ?? Microsoft.Win32.Registry.CurrentUser.CreateSubKey(RunKey);
         if (IsAutostart()) key.DeleteValue(RunValue, false);
-        else key.SetValue(RunValue, $"\"{Environment.ProcessPath}\"", Microsoft.Win32.RegistryValueKind.String);
+        else key.SetValue(RunValue, WindowsStartup.Command(Environment.ProcessPath!), Microsoft.Win32.RegistryValueKind.String);
+    }
+
+    private void ConfigureAura()
+    {
+        var options = _controller.Registry.Aura;
+        if (options.Enabled && _aura is not null && _auraPort == options.Port) { _aura.Invalidate(); return; }
+        _aura?.Dispose();
+        _aura = null;
+        if (!options.Enabled)
+        {
+            try { File.Delete(AuraStatusServer.EndpointPath); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { Debug.WriteLine(ex); }
+            return;
+        }
+        try
+        {
+            _aura = new AuraStatusServer(options.Port, maxAge: TimeSpan.FromMilliseconds(Math.Max(15000L, (long)_controller.Registry.PollMs * 3)));
+            _auraPort = options.Port;
+        }
+        catch (Exception ex)
+        {
+            Notify("Aura status unavailable", "The localhost status endpoint couldn't start. Check the configured port and apps.json folder permissions. " + ex.GetType().Name, null, ToolTipIcon.Warning);
+        }
     }
 
     private static void ToggleExplorer()
@@ -455,6 +493,7 @@ internal sealed class TrayApp : ApplicationContext
         _watcher?.Dispose();
         _reloadDebounce.Dispose();
         _hotkey.Dispose();
+        _aura?.Dispose();
         _controller.Dispose();
         _tray.Visible = false;
         _tray.Dispose();

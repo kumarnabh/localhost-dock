@@ -8,6 +8,9 @@ artifacts/
 .vscode/
 .idea/
 TestResults/
+.artifacts/
 
 # Never commit a personal registry.
 apps.json
+aura-endpoint.json
+aura-endpoint.json.tmp

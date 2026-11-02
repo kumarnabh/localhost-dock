@@ -44,6 +44,7 @@ public static partial class AppDetector
     public static List<Detection> Detect(string path)
     {
         path = path.Trim().Trim('"');
+        path = Path.GetFullPath(path);
         if (File.Exists(path)) return FromFile(path) is { } d ? new() { d } : new();
         if (Directory.Exists(path)) return FromFolder(path);
         return new();
@@ -55,7 +56,7 @@ public static partial class AppDetector
     /// </summary>
     public static Detection FromProcess(ProcessDetails d, int port)
     {
-        foreach (string dir in CandidateDirsFromCommandLine(d))
+        foreach (string dir in new[] { ProcessCwd.TryGet(d.Pid) }.Where(p => p is not null).Select(p => p!).Concat(CandidateDirsFromCommandLine(d)).Distinct(StringComparer.OrdinalIgnoreCase))
         {
             for (string? probe = dir; probe is not null; probe = Path.GetDirectoryName(probe))
             {
