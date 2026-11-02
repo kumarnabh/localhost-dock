@@ -16,6 +16,14 @@ internal abstract class HoverRow : Panel, IFilterable
     protected readonly Label TitleLabel, SubLabel;
     protected readonly FlowLayoutPanel Strip;
     private bool _hover;
+    private bool _selected;
+    internal void SelectResult(bool selected)
+    {
+        if (_selected == selected) return;
+        _selected = selected;
+        BackColor = _selected || _hover ? SurfaceHover : Surface;
+        BorderStyle = selected ? BorderStyle.FixedSingle : BorderStyle.None;
+    }
 
     protected HoverRow(params Button[] buttons)
     {
@@ -66,7 +74,7 @@ internal abstract class HoverRow : Panel, IFilterable
     {
         if (_hover == on) return;
         _hover = on;
-        BackColor = on ? SurfaceHover : Surface;
+        BackColor = on || _selected ? SurfaceHover : Surface;
         foreach (var b in Strip.Controls.OfType<Button>()) b.Invalidate();
     }
 
@@ -114,9 +122,7 @@ internal sealed class AppRow : HoverRow
     }
 
     public override bool Matches(string q) =>
-        App.Name.Contains(q, StringComparison.OrdinalIgnoreCase) ||
-        App.AllPorts.Any(p => p.ToString().StartsWith(q.TrimStart(':'))) ||
-        (App.Cwd ?? App.Start ?? "").Contains(q, StringComparison.OrdinalIgnoreCase);
+        DockSearch.Matches(q, App.Name, string.Join(" ", App.AllPorts.Select(p => ":" + p)), App.Cwd, App.Start, App.EffectiveUrl);
 
     public void Update(AppStatus s)
     {
@@ -139,6 +145,7 @@ internal sealed class AppRow : HoverRow
             _ => "no port set; ⋯ → Edit to finish setup",
         };
         if (app.StartUnverified && s.State != AppState.Up) state += " · start command unverified";
+        if (s.State == AppState.Down && s.RecoverableProcesses > 0) state += $" · {s.RecoverableProcesses} surviving process(es); Stop to recover";
         string mem = s.State is AppState.Up or AppState.Degraded && s.MemoryBytes > 0 ? $" · {Bytes(s.MemoryBytes)}" : "";
         string text = ports.Length > 0 ? $"{ports} · {state}{mem}" : state;
         if (SubLabel.Text != text)
@@ -157,8 +164,8 @@ internal sealed class AppRow : HoverRow
         _start.Enabled = hasStart && !busy && s.State is AppState.Down or AppState.NotConfigured or AppState.Conflict;
         // Only offer Stop when something of *this app's* is running, or its port is in conflict (Stop then asks first).
         // A stranger on an extra port while the app is down is not a reason to light up Stop.
-        _stop.Enabled = (up || s.State == AppState.Conflict || s.Listeners.Any(l => l.Ownership != Ownership.Foreign)) && s.State != AppState.Stopping;
-        _restart.Enabled = hasStart && up && !busy;
+        _stop.Enabled = (up || s.State == AppState.Conflict || s.RecoverableProcesses > 0 || s.Listeners.Any(l => l.Ownership != Ownership.Foreign)) && s.State != AppState.Stopping;
+        _restart.Enabled = hasStart && (up || s.RecoverableProcesses > 0) && !busy;
         Theme.Tips.SetToolTip(_stop, s.State == AppState.Conflict
             ? "Stop: the process on this port isn't verified as this app, so you'll be asked first"
             : "Stop");
@@ -192,27 +199,29 @@ internal sealed class WorkspaceRow : HoverRow
 {
     private readonly Button _start, _stop;
     private readonly WorkspaceEntry _ws;
+    internal WorkspaceEntry Workspace => _ws;
     private List<string> _memberNames = new();
 
     public WorkspaceRow(WorkspaceEntry ws, DockForm dock) : this(ws, dock,
+        IconButton(IconOpen, "Browse workspace apps", (_, _) => dock.NavigateWorkspace(ws.Id)),
         IconButton(IconPlay, "Start workspace (dependencies first)", (_, _) => dock.ActWorkspace(ws, "start")),
         IconButton(IconStop, "Stop workspace (dependents first)", (_, _) => dock.ActWorkspace(ws, "stop"), danger: true),
         IconButton(IconMore, "More", (_, _) => { }))
     {
     }
 
-    private WorkspaceRow(WorkspaceEntry ws, DockForm dock, Button start, Button stop, Button more) : base(start, stop, more)
+    private WorkspaceRow(WorkspaceEntry ws, DockForm dock, Button browse, Button start, Button stop, Button more) : base(browse, start, stop, more)
     {
         _ws = ws;
         (_start, _stop) = (start, stop);
         TitleLabel.Text = ws.Name;
         more.Click += (_, _) => dock.ShowWorkspaceMenu(ws, more, new Point(0, more.Height));
         OnBodyClick((s, e) => { if (e.Button == MouseButtons.Right) dock.ShowWorkspaceMenu(ws, (Control)s!, e.Location); });
-        OnBodyDoubleClick((_, _) => dock.ActWorkspace(ws, "start"));
+        OnBodyDoubleClick((_, _) => dock.NavigateWorkspace(ws.Id));
     }
 
     public override bool Matches(string q) =>
-        _ws.Name.Contains(q, StringComparison.OrdinalIgnoreCase) || _memberNames.Any(a => a.Contains(q, StringComparison.OrdinalIgnoreCase));
+        DockSearch.Matches(q, _ws.Name, string.Join(" ", _memberNames));
 
     public void Update(WorkspaceStatus w)
     {
@@ -224,7 +233,8 @@ internal sealed class WorkspaceRow : HoverRow
         // e.g. "2 of 3 ready · API ✓ · Web ✓ · Worker ✗"
         string marks = string.Join(" · ", w.Members.Select(m => m.App.Name + (m.State switch
         {
-            AppState.Up => " ✓",
+            AppState.Up when m.Ready => " ✓",
+            AppState.Up => " …",
             AppState.Starting or AppState.Stopping => " …",
             AppState.Degraded => " ⚠",
             AppState.Conflict => " ⚠",

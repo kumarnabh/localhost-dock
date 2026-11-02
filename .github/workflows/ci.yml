@@ -22,6 +22,9 @@ jobs:
       - name: Build
         run: dotnet build -c Release
 
+      - name: Aura adapter safety tests
+        run: node --test integrations/aura/localhost-dock.test.mjs
+
       - name: Dependency vulnerability scan
         shell: pwsh
         run: |

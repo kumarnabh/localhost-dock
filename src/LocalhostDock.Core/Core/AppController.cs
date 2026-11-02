@@ -41,18 +41,21 @@ public sealed record ExitInfo(int? Code, DateTime AtUtc, bool Expected, string P
 
 public sealed record AppStatus(
     AppEntry App, AppState State, IReadOnlyList<OwnedListener> Listeners, DateTime? UpSince, long MemoryBytes,
-    ExitInfo? LastExit, string? LastError, HealthSnapshot? Health = null, TimeSpan? LastStartDuration = null)
+    ExitInfo? LastExit, string? LastError, HealthSnapshot? Health = null, TimeSpan? LastStartDuration = null, int RecoverableProcesses = 0)
 {
-    /// <summary>Ownership of the process on the primary port (Unverified if several disagree).</summary>
+    /// <summary>Dependencies require verified ownership and a successful configured health check.</summary>
+    public bool Ready => State == AppState.Up && PrimaryOwnership is Ownership.Owned or Ownership.Matched &&
+        (HealthUrl.Resolve(App) is null || Health?.Healthy == true);
+    /// <summary>Least trusted ownership on the primary port: any foreign binding wins.</summary>
     public Ownership? PrimaryOwnership =>
-        Listeners.Where(l => l.Listener.Port == App.Port).Select(l => (Ownership?)l.Ownership).OrderBy(o => o).FirstOrDefault();
+        Listeners.Where(l => l.Listener.Port == App.Port).Select(l => (Ownership?)l.Ownership).OrderByDescending(o => o).FirstOrDefault();
 
-    public OwnedListener? ForeignHolder => Listeners.FirstOrDefault(l => l.Listener.Port == App.Port && l.Ownership == Ownership.Foreign);
+    public OwnedListener? ForeignHolder => Listeners.FirstOrDefault(l => l.Ownership == Ownership.Foreign);
 }
 
 public sealed record WorkspaceStatus(WorkspaceEntry Workspace, IReadOnlyList<AppStatus> Members)
 {
-    public int Up => Members.Count(m => m.State == AppState.Up);
+    public int Up => Members.Count(m => m.Ready);
     public bool Busy => Members.Any(m => m.State is AppState.Starting or AppState.Stopping);
 }
 
@@ -63,7 +66,7 @@ public sealed record DiscoveredPort(int Port, int Pid, string ProcessName, strin
 }
 
 public sealed record Snapshot(IReadOnlyList<AppStatus> Apps, IReadOnlyList<WorkspaceStatus> Workspaces,
-    IReadOnlyList<DiscoveredPort> Discovered, IReadOnlyList<Listener> AllListeners);
+    IReadOnlyList<DiscoveredPort> Discovered, IReadOnlyList<Listener> AllListeners, DateTime? CapturedAtUtc = null);
 
 public sealed record OperationResult(bool Ok, string Message)
 {
@@ -100,6 +103,8 @@ public sealed class AppController : IDisposable
     private readonly HashSet<string> _openOnReady = new();
     private readonly List<AppEntry> _readyToOpen = new();
     private readonly Dictionary<string, LaunchedProcess> _launched = new();
+    private readonly Dictionary<string, List<ProcessIdentity>> _owned = new();
+    private readonly Dictionary<string, string> _healthOwners = new();
     private readonly Dictionary<string, DateTime> _userStopped = new();
     private readonly Dictionary<string, List<(ProcessIdentity Id, SafeProcessHandle Handle)>> _watch = new();
     private readonly Dictionary<string, ExitInfo> _lastExit = new();
@@ -146,22 +151,38 @@ public sealed class AppController : IDisposable
             var mine = app.AllPorts.SelectMany(p => byPort[p]).Select(l => Classify(app, l, tree)).ToList();
             var primary = mine.Where(o => o.Listener.Port == app.Port).ToList();
             bool appOnPrimary = primary.Any(o => o.Ownership != Ownership.Foreign);
+            bool verifiedPrimary = primary.Count > 0 && primary.All(o => o.Ownership is Ownership.Owned or Ownership.Matched);
+            bool conflict = mine.Any(o => o.Ownership == Ownership.Foreign);
+            lock (_lock)
+            {
+                if (_launched.TryGetValue(app.Id, out var root) && root.Identity.IsAlive())
+                {
+                    if (!_owned.TryGetValue(app.Id, out var known)) _owned[app.Id] = known = new();
+                    known.RemoveAll(id => !id.IsAlive());
+                    foreach (var id in ProcessTree.Descendants(root.Identity, tree))
+                        if (!known.Any(k => k.SameAs(id))) known.Add(id);
+                }
+                string key = string.Join(";", primary.Select(o => $"{o.Identity?.Pid}/{o.Identity?.CreationTicks}/{o.Ownership}").OrderBy(x => x)) + app.Port + app.Health;
+                if (_healthOwners.TryGetValue(app.Id, out var previous) && previous != key) Health.Reset(app.Id);
+                _healthOwners[app.Id] = key;
+            }
 
             // Health: checked in the background while the app's own process is listening.
             bool hasHealth = HealthUrl.Resolve(app) is not null;
             bool starting;
             lock (_lock) starting = _lifecycle.TryGetValue(app.Id, out var l0) && l0.State == AppState.Starting;
             HealthSnapshot? health = null;
-            if (appOnPrimary && hasHealth)
+            if (verifiedPrimary && !conflict && hasHealth)
             {
                 var before = Health.Get(app.Id);
                 Health.MaybeCheck(app, urgent: starting && before?.Last?.Ok != true);
                 health = Health.Get(app.Id) ?? before;
             }
-            else if (!appOnPrimary) Health.Reset(app.Id);
+            else Health.Reset(app.Id);
 
-            bool ready = appOnPrimary && (!hasHealth || health?.Last?.Ok == true);
+            bool ready = verifiedPrimary && !conflict && (!hasHealth || health?.Last?.Ok == true);
             AppState state = app.Port is null ? AppState.NotConfigured
+                : conflict ? AppState.Conflict
                 : appOnPrimary ? (hasHealth && health is { ConsecutiveFailures: >= 2 } ? AppState.Degraded : AppState.Up)
                 : primary.Count > 0 ? AppState.Conflict
                 : AppState.Down;
@@ -196,7 +217,7 @@ public sealed class AppController : IDisposable
                 }
             }
 
-            var appProcs = mine.Where(o => o.Ownership != Ownership.Foreign && o.Identity is not null).Select(o => o.Identity!).DistinctBy(i => i.Pid).ToList();
+            var appProcs = mine.Where(o => o.Ownership is Ownership.Owned or Ownership.Matched && o.Identity is not null).Select(o => o.Identity!).DistinctBy(i => i.Pid).ToList();
             DateTime? since = appProcs.Count > 0 && state is AppState.Up or AppState.Degraded ? appProcs.Min(i => i.CreatedUtc).ToLocalTime() : null;
             long memory = 0;
             foreach (var id in appProcs)
@@ -214,20 +235,23 @@ public sealed class AppController : IDisposable
             ExitInfo? lastExit;
             string? lastError;
             TimeSpan? duration;
+            int surviving;
             lock (_lock)
             {
                 _lastExit.TryGetValue(app.Id, out lastExit);
                 _lastError.TryGetValue(app.Id, out lastError);
                 duration = _startDurations.TryGetValue(app.Id, out var d) ? d : null;
+                surviving = (_owned.GetValueOrDefault(app.Id) ?? new()).Count(id => id.IsAlive());
+                if (surviving == 0 && _launched.TryGetValue(app.Id, out var root) && root.Identity.IsAlive()) surviving = 1;
             }
-            statuses.Add(new AppStatus(app, state, mine, since, memory, lastExit, lastError, health, duration));
+            statuses.Add(new AppStatus(app, state, mine, since, memory, lastExit, lastError, health, duration, surviving));
         }
 
         var workspaceStatuses = workspaces
             .Select(w => new WorkspaceStatus(w, w.Apps.Select(id => statuses.FirstOrDefault(s => s.App.Id == id)).Where(s => s is not null).Select(s => s!).ToList()))
             .ToList();
 
-        return new Snapshot(statuses, workspaceStatuses, Discover(listeners, apps, ignored), listeners);
+        return new Snapshot(statuses, workspaceStatuses, Discover(listeners, apps, ignored), listeners, DateTime.UtcNow);
     }
 
     /// <summary>Apps that became ready after a dock Start and want their URL opened (the UI opens them).</summary>
@@ -306,6 +330,9 @@ public sealed class AppController : IDisposable
 
         LaunchedProcess? launched;
         lock (_lock) _launched.TryGetValue(app.Id, out launched);
+        lock (_lock)
+            if (_owned.TryGetValue(app.Id, out var known) && known.Any(k => k.SameAs(id)))
+                return new(l, Ownership.Owned, id, "previously observed in this app's launched process tree");
         if (launched is not null && ProcessTree.IsDescendantOf(id, launched.Identity, tree))
             return new(l, Ownership.Owned, id, "started by Localhost Dock");
 
@@ -315,8 +342,8 @@ public sealed class AppController : IDisposable
         var d = ProcessInfo.Get(l.Pid);
         string? cwd = ProcessCwd.TryGet(l.Pid);
         if (cwd is not null && markers.Any(m => IsUnder(cwd, m))) return new(l, Ownership.Matched, id, $"runs in {cwd}");
-        string text = $"{d?.CommandLine} {d?.ExecutablePath ?? id.ImagePath}";
-        if (markers.Any(m => text.Contains(m, StringComparison.OrdinalIgnoreCase))) return new(l, Ownership.Matched, id, "its command line points into the app's folder");
+        if (ProcessOwnership.MatchesProject(d?.ExecutablePath ?? id.ImagePath, d?.CommandLine, markers))
+            return new(l, Ownership.Matched, id, "its executable or entry script is inside the app's folder");
         if (d?.CommandLine is null && cwd is null) return new(l, Ownership.Unverified, id, d?.Restriction ?? "its details aren't readable.");
         return new(l, Ownership.Foreign, id, cwd is not null ? $"it runs in {cwd}, not in the app's folder" : "nothing about it points to the app's folder");
     }
@@ -423,8 +450,17 @@ public sealed class AppController : IDisposable
     /// <summary>Starts and waits until the app's own process listens on its port (or fails/times out).</summary>
     public async Task<OperationResult> StartAndWaitAsync(AppEntry app, CancellationToken ct = default)
     {
+        var gate = Gate(app);
+        if (!await gate.WaitAsync(0, ct)) return Busy(app);
+        try { return await StartAndWaitCoreAsync(app, ct); }
+        finally { gate.Release(); }
+    }
+
+    private async Task<OperationResult> StartAndWaitCoreAsync(AppEntry app, CancellationToken ct)
+    {
         var sw = Stopwatch.StartNew();
-        var started = await StartAsync(app);
+        ct.ThrowIfCancellationRequested();
+        var started = StartCore(app);
         // "Already running" still has to prove it's ready (e.g. healthy) before dependents may start.
         if (!started.Ok && !started.Message.Contains("already running")) return started;
         if (app.Port is not int port) return started;
@@ -435,12 +471,17 @@ public sealed class AppController : IDisposable
         while (DateTime.UtcNow < until)
         {
             ct.ThrowIfCancellationRequested();
-            var mine = PortTable.GetListeners().Where(l => l.Port == port).Select(l => Classify(app, l)).ToList();
-            if (mine.Any(o => o.Ownership != Ownership.Foreign))
+            var bindings = PortTable.GetListeners().Where(l => app.AllPorts.Contains(l.Port)).Select(l => Classify(app, l)).ToList();
+            if (bindings.Any(o => o.Ownership is Ownership.Foreign or Ownership.Unverified))
+                return Fail(app, $"A configured port for {app.Name} acquired an unverified owner while starting. No other process was stopped.");
+            var mine = bindings.Where(o => o.Listener.Port == port).ToList();
+            if (mine.Count > 0 && mine.All(o => o.Ownership is Ownership.Owned or Ownership.Matched))
             {
                 if (!hasHealth) return Ready("up");
                 lastHealth = await Health.CheckNowAsync(app, ct);
-                if (lastHealth.Ok) return Ready($"healthy ({lastHealth.LatencyMs:0} ms)");
+                var after = PortTable.GetListeners().Where(l => app.AllPorts.Contains(l.Port)).Select(l => Classify(app, l)).ToList();
+                if (lastHealth.Ok && bindings.Select(o => (o.Listener, o.Identity)).ToHashSet().SetEquals(after.Select(o => (o.Listener, o.Identity))))
+                    return Ready($"healthy ({lastHealth.LatencyMs:0} ms)");
             }
 
             LaunchedProcess? launched;
@@ -466,19 +507,22 @@ public sealed class AppController : IDisposable
             return OperationResult.Fail($"{app.Name} has no start command. Use ⋯ → Edit… to add one.");
 
         // Never launch a second copy, and never start into a port someone else holds.
-        foreach (int port in app.Port is int p ? new[] { p } : Array.Empty<int>())
+        bool alreadyRunning = false;
+        var listeners = PortTable.GetListeners();
+        foreach (int port in app.AllPorts)
         {
-            var holders = PortTable.GetListeners().Where(l => l.Port == port).Select(l => Classify(app, l)).ToList();
-            if (holders.FirstOrDefault(h => h.Ownership == Ownership.Foreign) is { } foreign && holders.All(h => h.Ownership == Ownership.Foreign))
-                return OperationResult.Fail($"Port :{port} is held by {foreign.Identity?.ToString() ?? "pid " + foreign.Listener.Pid}, which isn't {app.Name} ({foreign.Evidence}). Free the port (Who's on port → Kill) or change {app.Name}'s port.");
+            var holders = listeners.Where(l => l.Port == port).Select(l => Classify(app, l)).ToList();
+            if (holders.FirstOrDefault(h => h.Ownership is Ownership.Foreign or Ownership.Unverified) is { } foreign)
+                return Fail(app, $"Port :{port} is held by {foreign.Identity?.ToString() ?? "pid " + foreign.Listener.Pid}, which isn't {(foreign.Ownership == Ownership.Foreign ? "" : "verified as ")}{app.Name} ({foreign.Evidence}). Resolve the port conflict before starting.");
             if (holders.Count > 0)
-                return OperationResult.Fail($"{app.Name} is already running on :{port}.");
+                alreadyRunning = true;
         }
+        if (alreadyRunning) return OperationResult.Fail($"{app.Name} is already running on one of its configured ports.");
         lock (_lock)
         {
-            if (_lifecycle.TryGetValue(app.Id, out var lc) && lc.State == AppState.Starting &&
-                _launched.TryGetValue(app.Id, out var running) && running.Identity.IsAlive())
-                return OperationResult.Fail($"{app.Name} is already starting.");
+            if ((_launched.TryGetValue(app.Id, out var running) && running.Identity.IsAlive()) ||
+                (_owned.TryGetValue(app.Id, out var known) && known.Any(id => id.IsAlive())))
+                return Fail(app, $"{app.Name} still has processes from its previous launch. Use Stop or Restart to recover before starting another copy.");
         }
 
         LaunchedProcess? launched;
@@ -520,7 +564,10 @@ public sealed class AppController : IDisposable
         try
         {
             // 1. The app's own stop script, if it has one.
-            if (!string.IsNullOrWhiteSpace(app.Stop))
+            bool unsafeHolder = PortTable.GetListeners().Where(l => app.AllPorts.Contains(l.Port))
+                .Any(l => Classify(app, l).Ownership is Ownership.Foreign or Ownership.Unverified);
+            if (unsafeHolder && !string.IsNullOrWhiteSpace(app.Stop)) notes.Add("The stop script was skipped because a configured port has an unverified owner.");
+            if (!unsafeHolder && !string.IsNullOrWhiteSpace(app.Stop))
             {
                 int? code;
                 try { code = await Launcher.RunAndWaitAsync(app.Stop, app.Cwd, TimeSpan.FromSeconds(20)); }
@@ -577,6 +624,10 @@ public sealed class AppController : IDisposable
         {
             return Done(OperationResult.Fail($"Stopping {app.Name} was cancelled."));
         }
+        catch (InvalidOperationException ex)
+        {
+            return Done(Fail(app, ex.Message));
+        }
 
         OperationResult Done(OperationResult r)
         {
@@ -588,13 +639,23 @@ public sealed class AppController : IDisposable
     private async Task StopLaunchedAsync(AppEntry app, List<string> notes, CancellationToken ct)
     {
         LaunchedProcess? launched;
-        lock (_lock) _launched.Remove(app.Id, out launched);
-        if (launched is null) return;
-        using (launched)
+        List<ProcessIdentity> known;
+        lock (_lock)
         {
-            if (!launched.Identity.IsAlive()) return;
-            var r = await ProcessGuard.TerminateTreeAsync(launched.Identity, app.Policy, TimeSpan.FromSeconds(app.GracefulTimeoutSec), ct);
+            _launched.TryGetValue(app.Id, out launched);
+            known = _owned.GetValueOrDefault(app.Id)?.ToList() ?? new();
+        }
+        if (launched is not null) known.Add(launched.Identity);
+        foreach (var id in known.Distinct().Where(i => i.IsAlive()))
+        {
+            var r = await ProcessGuard.TerminateTreeAsync(id, app.Policy, TimeSpan.FromSeconds(app.GracefulTimeoutSec), ct);
             if (!r.Ok) notes.Add(r.Message);
+        }
+        if (known.Any(i => i.IsAlive())) throw new InvalidOperationException("Some processes from the previous launch are still running. " + string.Join(" ", notes));
+        lock (_lock)
+        {
+            if (_launched.Remove(app.Id, out var old)) old.Dispose();
+            _owned.Remove(app.Id);
         }
     }
 
@@ -644,8 +705,10 @@ public sealed class AppController : IDisposable
                     var app = members[id];
                     if (string.IsNullOrWhiteSpace(app.Start))
                     {
-                        if (IsListeningAsApp(app)) ready.Add(id);
-                        else failed[id] = $"{app.Name} has no start command and isn't running.";
+                        bool healthy = IsListeningAsApp(app) && (HealthUrl.Resolve(app) is null || (await Health.CheckNowAsync(app, ct)).Ok);
+                        if (healthy) ready.Add(id);
+                        else failed[id] = $"{app.Name} has no start command and isn't ready (check ownership and health).";
+                        if (failed.ContainsKey(id) && ws.OnFailure != "continue") { haltedAt = id; break; }
                         continue;
                     }
                     progress?.Invoke(app.Name);
@@ -694,15 +757,30 @@ public sealed class AppController : IDisposable
 
         var members = Members(ws).ToDictionary(a => a.Id);
         var failures = new List<string>();
+        var preserve = new HashSet<string>();
         foreach (var id in order)
         {
             if (!members.TryGetValue(id, out var app)) continue;
+            if (preserve.Contains(id))
+            {
+                failures.Add($"Kept {app.Name} running because a dependent couldn't stop.");
+                continue;
+            }
             bool running = app.AllPorts.Any(p => PortTable.GetListeners().Any(l => l.Port == p));
             bool launched;
             lock (_lock) launched = _launched.ContainsKey(app.Id);
             if (!running && !launched) continue;
             var r = await StopAsync(app, confirm, ct);
-            if (!r.Ok) failures.Add(r.Message);
+            if (!r.Ok)
+            {
+                failures.Add(r.Message);
+                void PreserveDependencies(string member)
+                {
+                    foreach (var dependency in ws.DependenciesOf(member))
+                        if (preserve.Add(dependency)) PreserveDependencies(dependency);
+                }
+                PreserveDependencies(id);
+            }
         }
         return failures.Count == 0
             ? OperationResult.Success($"“{ws.Name}” stopped.")
@@ -710,7 +788,8 @@ public sealed class AppController : IDisposable
     }
 
     private bool IsListeningAsApp(AppEntry app) =>
-        app.Port is int p && PortTable.GetListeners().Where(l => l.Port == p).Select(l => Classify(app, l)).Any(o => o.Ownership != Ownership.Foreign);
+        app.Port is int p && PortTable.GetListeners().Where(l => l.Port == p).Select(l => Classify(app, l)).ToList() is { Count: > 0 } mine &&
+        mine.All(o => o.Ownership is Ownership.Owned or Ownership.Matched);
 
     private List<AppEntry> Members(WorkspaceEntry ws)
     {

@@ -58,6 +58,10 @@ It only suggests. Every field stays editable, and the dialog warns you when a po
 
 **`ldock` command line.** Read-only, machine-readable status for scripts and AI coding agents: `ldock status --json`, `ldock who 5173`, and `ldock manifest` (with secrets redacted). See [docs/CLI.md](docs/CLI.md).
 
+**Aura integration.** Enable *Tray → Settings → Aura: read-only localhost status* for authenticated, cached status on `127.0.0.1`. Aura gets health, readiness, uptime, memory and workspace status through the included Node adapter. It cannot start, stop or execute anything. [Setup and contract](docs/AURA.md).
+
+**Project presets and navigation.** Import presets for Aura, AssetLab, Vyora and NNPlays from **+ Add → Import workspace presets…**. Nothing starts on import. Search names, ports and folders with multiple words; use ↑/↓ and Enter to open an app or browse a workspace, and Escape to return.
+
 **Notifications.**
 - **Crash toast** when an app goes down without you stopping it. Click it to restart.
 - **Didn't start** when nothing came up within 90 s. Click it to view the logs.
@@ -75,7 +79,7 @@ You can switch to crashes-only, or turn them off, in tray menu → *Settings*.
 
 **Your launchers stay yours.** Localhost Dock runs your existing `.cmd` files exactly as a double-click would, and never edits them.
 
-It's a small .NET 10 WinForms app plus the `ldock` CLI. It has no background service, needs no admin rights and sends nothing over the network.
+It's a small .NET 10 WinForms app plus the `ldock` CLI. It has no background service, needs no admin rights, and communicates only over loopback for health checks and optional Aura status.
 
 ## Install
 
@@ -127,7 +131,7 @@ Upgrading is safe to run over a working install. The new build is staged and sel
 
 For workspaces, a filled dot means every member is ready, a ring means some are, and red means none are. Orange means one of them has a problem.
 
-Status comes from the OS TCP listener table, polled every 2 seconds by default. The only HTTP requests are the health checks you configure, and those go to this machine only (localhost, 127.x, ::1).
+Status comes from the OS TCP listener table, polled every 2 seconds by default. Health checks go to this machine only (localhost, 127.x, ::1). Optional Aura status is restricted to this machine and never controls services.
 
 ## Configuration
 
@@ -159,7 +163,7 @@ Stopping processes is the one dangerous thing this app does, so it's built aroun
 - **One operation at a time per app.** Restart only starts again once the stop is verified complete, and workspace stops go one app at a time, dependents first.
 - **Your config is protected.** Edits made outside the dock are never overwritten. Every save keeps a backup, a corrupt `apps.json` is recovered from the newest good backup, and schema upgrades back up the original first.
 - Detection only *reads* your files. Nothing is saved until you press Save or Add.
-- Your registry and logs stay on your machine. Localhost Dock makes no network calls beyond your own health checks, which only reach this machine.
+- Your registry and logs stay on your machine. Health checks and optional authenticated Aura status use loopback only.
 - The **conflict wizard** shows exactly what holds a port before offering to stop it, and its buttons ignore clicks for a moment after it appears, so a stray click can't choose for you.
 - `ldock` is read-only: it can't start, stop or change anything.
 
@@ -171,6 +175,7 @@ These rules are covered by a dedicated safety test suite that CI runs before any
 - [How it works](docs/ARCHITECTURE.md)
 - [Troubleshooting](docs/TROUBLESHOOTING.md)
 - [Command line (`ldock`)](docs/CLI.md)
+- [Aura integration and project presets](docs/AURA.md)
 - [Upgrade backlog status](docs/BACKLOG-STATUS.md)
 - [Roadmap](ROADMAP.md) · [Changelog](CHANGELOG.md) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)
 

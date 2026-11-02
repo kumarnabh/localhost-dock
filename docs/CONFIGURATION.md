@@ -1,5 +1,9 @@
 # Configuration reference
 
+## Optional Aura status
+
+`"aura": { "enabled": false, "port": 0 }` controls the read-only status endpoint. It is off by default; port 0 selects a free IPv4 loopback port. Invalid ports disable it. Enable from tray Settings or edit and reload `apps.json`. Each start uses a new bearer token; there are no commands or lifecycle routes. See [Aura integration](AURA.md) for discovery, the Node adapter, security, presets and recovery.
+
 Localhost Dock reads a single file:
 
 ```
@@ -121,7 +125,7 @@ The dock remembers which apps are running (`session.json` next to `apps.json`). 
 | Path to an existing `.exe` | The exe itself |
 | Anything else (`npm run dev`, `python -m http.server 8000`, …) | `cmd.exe /d /s /c "<command>"` (`/s`: only the outermost quotes are removed, so quoting is predictable) |
 
-Paths can contain spaces and don't need quotes. Arguments after a file path aren't supported. If you need them, write the whole thing as a command line (`"C:\path\tool.exe" --flag`), which runs through `cmd.exe`.
+Bare file paths may contain spaces. With arguments, quote the file path (`"C:\path\tool.exe" --flag`). Existing `.exe`/`.ps1` files run directly with those arguments and default to their own folder; `.cmd`/`.bat` use cmd's outer quoting rules. Relative file paths resolve against explicit `cwd`. Missing explicit working directories fail with a diagnostic.
 
 The process starts in its own console window (minimized by default), in `cwd`, or in the launcher's own folder if `cwd` isn't set. That matches launchers that do `cd /d "%~dp0"`.
 
@@ -156,7 +160,7 @@ How the dock decides a listening process belongs to an app:
 | Evidence | Ownership | Stop without asking? |
 | --- | --- | --- |
 | A verified descendant of the process the dock launched for the app (parent chain checked by creation time) | **owned** | yes |
-| Its working directory, command line or executable path is inside the app's folder (`cwd`, or the launcher's folder) | **matched** | yes |
+| Its working directory, executable or interpreter entry script is inside the app's folder (directory-bounded; arbitrary command arguments do not count) | **matched** | yes |
 | Its details can't be read (elevated / other user), or the app has no folder to compare | **unverified** | asks |
 | Readable, but nothing points to the app's folder | **foreign** → the app shows a *port conflict* | asks |
 

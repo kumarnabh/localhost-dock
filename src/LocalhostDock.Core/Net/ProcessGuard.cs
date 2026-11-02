@@ -80,7 +80,7 @@ public static class ProcessGuard
 
         if (policy != StopPolicy.Force)
         {
-            AskToExit(now);
+            AskToExit(now, tree);
             if (await WaitForExitAsync(now, gracefulTimeout, ct))
             {
                 // Children that outlived their parent are still the app's; they get the same treatment below.
@@ -90,7 +90,7 @@ public static class ProcessGuard
             if (policy == StopPolicy.GracefulOnly)
                 return now.IsAlive()
                     ? new(KillOutcome.Failed, $"{now} didn't exit within {gracefulTimeout.TotalSeconds:0} s, and this app's stop policy forbids force-killing it.")
-                    : new(KillOutcome.Stopped, $"{now} exited gracefully (some child processes are still running).");
+                    : new(KillOutcome.Failed, $"{now} exited gracefully, but child processes remain and this app's stop policy forbids force-killing them.");
         }
 
         // Force: leaves first, revalidating each identity immediately before killing it.
@@ -102,6 +102,11 @@ public static class ProcessGuard
             try
             {
                 using var proc = Process.GetProcessById(p.Pid);
+                // Open and pin the actual kill handle before comparing creation time. A PID lookup followed
+                // by opening a new handle would otherwise leave a PID-reuse race between check and kill.
+                if (!Native.GetProcessTimes(proc.SafeHandle, out long created, out _, out _, out _) || created != p.CreationTicks)
+                    continue;
+                if (WhyProtected(p) is not null) continue;
                 proc.Kill();
             }
             catch (Exception ex) when (ex is InvalidOperationException or ArgumentException) { /* exited meanwhile */ }
@@ -110,6 +115,7 @@ public static class ProcessGuard
 
         await WaitForExitAsync(now, TimeSpan.FromSeconds(5), ct);
         if (now.IsAlive()) return new(KillOutcome.Failed, $"Couldn't stop {now}. {string.Join(" ", failures)}".Trim());
+        if (tree.Any(p => p.IsAlive())) return new(KillOutcome.Failed, $"Some child processes are still running. {string.Join(" ", failures)}".Trim());
         return failures.Count == 0
             ? new(KillOutcome.Stopped, policy == StopPolicy.Force ? $"{now} was stopped." : $"{now} didn't exit in time and was force-stopped.")
             : new(KillOutcome.Stopped, $"{now} was stopped, but some child processes couldn't be: {string.Join(" ", failures)}");
@@ -135,16 +141,18 @@ public static class ProcessGuard
     }
 
     /// <summary>Graceful request: close the main window if it has one, and send Ctrl+C to its console.</summary>
-    private static void AskToExit(ProcessIdentity id)
+    private static void AskToExit(ProcessIdentity id, IReadOnlyList<ProcessIdentity> tree)
     {
         try
         {
             using var proc = Process.GetProcessById(id.Pid);
+            if (!Native.GetProcessTimes(proc.SafeHandle, out long created, out _, out _, out _) || created != id.CreationTicks) return;
             if (proc.MainWindowHandle != IntPtr.Zero) proc.CloseMainWindow();
         }
         catch { /* exited */ }
 
-        // Ctrl+C reaches every process on the target's console, which for a launched dev server is its own tree.
+        // Ctrl+C broadcasts to the whole console. External servers can share a terminal with unrelated
+        // projects, so only signal if every attached process is a verified member of this captured tree.
         // Only possible from a process without its own console (the dock is a GUI app; test hosts are not).
         lock (ConsoleLock)
         {
@@ -152,10 +160,17 @@ public static class ProcessGuard
             if (!Native.AttachConsole((uint)id.Pid)) return;
             try
             {
+                var processes = new uint[256];
+                uint count = Native.GetConsoleProcessList(processes, (uint)processes.Length);
+                if (count == 0 || count > processes.Length || !CanSignalConsole(processes.Take((int)count).Select(p => (int)p), tree)) return;
                 Native.SetConsoleCtrlHandler(IntPtr.Zero, true); // ignore it ourselves (permanently; we're a GUI app)
                 Native.GenerateConsoleCtrlEvent(Native.CTRL_C_EVENT, 0);
             }
             finally { Native.FreeConsole(); }
         }
     }
+
+    internal static bool CanSignalConsole(IEnumerable<int> processes, IReadOnlyList<ProcessIdentity> allowed) =>
+        processes.All(pid => pid == Environment.ProcessId ||
+            ProcessIdentity.Capture(pid) is { } current && allowed.Any(id => id.SameAs(current)));
 }

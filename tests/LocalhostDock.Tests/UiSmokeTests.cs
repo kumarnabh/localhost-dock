@@ -74,6 +74,32 @@ public class UiSmokeTests
     };
 
     [Fact]
+    public void Preset_import_review_renders_and_fits() => OnSta(() => Render(new PresetImportDialog(
+        Workspace.WorkspacePresets.Read(Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../../presets/nabh-projects.example.json")))), "preset-import"));
+
+    [Fact]
+    public void Workspace_navigation_filters_members_and_search_without_starting() => OnSta(() =>
+    {
+        using var controller = new AppController(SampleRegistry());
+        using var dock = new DockForm(controller, () => { });
+        var snapshot = new Snapshot(controller.Registry.Apps.Select(a => new AppStatus(a, AppState.Down,
+            Array.Empty<OwnedListener>(), null, 0, null, null)).ToList(),
+            new[] { new WorkspaceStatus(controller.Registry.Workspaces[0], Array.Empty<AppStatus>()) },
+            Array.Empty<DiscoveredPort>(), Array.Empty<LocalhostDock.Net.Listener>());
+        dock.Render(snapshot);
+        dock.NavigateWorkspace("shop");
+        // Inspect visibility from an off-screen window; no service actions are invoked by navigation.
+        dock.StartPosition = FormStartPosition.Manual;
+        dock.Location = new Point(-32000, -32000);
+        dock.Show();
+        var list = dock.Controls.OfType<FlowLayoutPanel>().Single();
+        Assert.Equal(3, list.Controls.OfType<AppRow>().Count(r => r.Visible));
+        dock.NavigateWorkspace(null);
+        Assert.Equal(4, list.Controls.OfType<AppRow>().Count(r => r.Visible));
+        dock.Close();
+    });
+
+    [Fact]
     public void Workspace_editor_renders_and_fits() => OnSta(() =>
     {
         var reg = SampleRegistry();

@@ -69,7 +69,7 @@ public sealed class HealthMonitor : IDisposable
             UseProxy = false,
             AllowAutoRedirect = false, // a 3xx counts as healthy; never follow it off-machine
             ConnectTimeout = TimeSpan.FromSeconds(5),
-            PooledConnectionLifetime = TimeSpan.FromMinutes(1),
+            PooledConnectionLifetime = TimeSpan.Zero, // each result must probe the current listener after port reuse
             ConnectCallback = ConnectLoopbackAsync,
         })
         { Timeout = Timeout.InfiniteTimeSpan };
@@ -109,7 +109,7 @@ public sealed class HealthMonitor : IDisposable
         var copy = app.Clone();
         _ = Task.Run(async () =>
         {
-            try { await CheckNowAsync(copy, CancellationToken.None, alreadyFlagged: true); }
+            try { await CheckNowAsync(copy, CancellationToken.None, s); }
             catch { /* recorded as a failed sample */ }
         });
     }
@@ -159,12 +159,11 @@ public sealed class HealthMonitor : IDisposable
     }
 
     /// <summary>Runs one check now and records it.</summary>
-    public Task<HealthSample> CheckNowAsync(AppEntry app, CancellationToken ct) => CheckNowAsync(app, ct, alreadyFlagged: false);
+    public Task<HealthSample> CheckNowAsync(AppEntry app, CancellationToken ct) => CheckNowAsync(app, ct, _states.GetOrAdd(app.Id, _ => new State()));
 
-    private async Task<HealthSample> CheckNowAsync(AppEntry app, CancellationToken ct, bool alreadyFlagged)
+    private async Task<HealthSample> CheckNowAsync(AppEntry app, CancellationToken ct, State s)
     {
-        var s = _states.GetOrAdd(app.Id, _ => new State());
-        if (!alreadyFlagged) lock (s.Lock) s.InFlight = true;
+        lock (s.Lock) s.InFlight = true;
 
         HealthSample sample;
         var uri = HealthUrl.Resolve(app);
@@ -191,6 +190,11 @@ public sealed class HealthMonitor : IDisposable
             catch (HttpRequestException ex)
             {
                 sample = new HealthSample(DateTime.UtcNow, false, null, sw.Elapsed.TotalMilliseconds, ex.InnerException?.Message ?? ex.Message);
+            }
+            catch (OperationCanceledException)
+            {
+                lock (s.Lock) s.InFlight = false;
+                throw;
             }
         }
 

@@ -6,6 +6,8 @@
 - It never writes `apps.json`, not even to migrate or repair it.
 - It works whether or not the tray app is running.
 
+For live, cached status from the running tray controller, use the optional [Aura status interface](AURA.md). The CLI remains read-only and does not enable that interface. Status JSON also includes `ready` (verified ownership plus configured health) and `recoverableProcesses`; workspace `notReady` follows readiness rather than the port state alone.
+
 ```
 ldock status [--json] [--no-health]   every app: state, ownership, processes, health, uptime
 ldock who <port> [--json]             what's listening on a port (or whether Windows reserves it)

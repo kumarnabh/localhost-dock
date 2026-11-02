@@ -2,6 +2,24 @@
 
 All notable changes to this project are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- Opt-in authenticated Aura status on IPv4 loopback, cached allowlisted status and tested server-side Node adapter. No command/lifecycle API. See [Aura integration](docs/AURA.md).
+- Reviewable workspace preset import for existing Aura, AssetLab, Vyora and NNPlays projects; existing entries are preserved and new commands require first-start confirmation.
+- Keyboard result selection, multiword search and workspace browsing with Escape to return.
+- Manual recovery of observed orphaned descendants, including workers without a port.
+
+### Fixed
+
+- Start checks secondary ports and all bindings; unknown ownership cannot satisfy readiness. Failed dependent stops retain prerequisites.
+- Ownership rejects sibling path prefixes and unrelated command arguments. Force termination pins its handle before creation-time verification.
+- Graceful Ctrl+C checks every attached console process and refuses to broadcast into a terminal shared with unrelated projects.
+- Health state is invalidated on listener/config changes; probes use fresh connections and release in-flight state on cancellation.
+- Relative/quoted launcher working directories and exact Windows startup command recognition.
+- Listener-table growth retries; enumeration errors fail closed instead of reporting free ports.
+
 ## [0.4.0] - 2026-10-31
 
 Batch 2 of the upgrade backlog: workspaces and health. Per-item status is in [docs/BACKLOG-STATUS.md](docs/BACKLOG-STATUS.md).

@@ -26,6 +26,9 @@
 
   <ItemGroup>
     <None Include="..\..\apps.example.json" Link="apps.example.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\..\presets\*.json" Link="presets\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\..\integrations\aura\localhost-dock.mjs" Link="integrations\aura\localhost-dock.mjs" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\..\docs\AURA.md" Link="docs\AURA.md" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 
 </Project>

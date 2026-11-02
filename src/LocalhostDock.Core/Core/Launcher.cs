@@ -41,10 +41,12 @@ public static class Launcher
     /// runs as that file (so existing launchers behave exactly as when double-clicked); anything else runs through
     /// cmd.exe. Uses cmd's /s rule (strip only the outermost quotes) so quoting is predictable.
     /// </summary>
-    public static (string File, string Args, string? DefaultCwd) Build(string command)
+    public static (string File, string Args, string? DefaultCwd) Build(string command, string? cwd = null)
     {
         string trimmed = command.Trim();
         string unquoted = trimmed.Trim('"');
+        if (!Path.IsPathFullyQualified(unquoted) && !string.IsNullOrWhiteSpace(cwd) && File.Exists(Path.Combine(cwd, unquoted)))
+            unquoted = Path.Combine(cwd, unquoted);
         string cmd = Environment.GetEnvironmentVariable("ComSpec") is { Length: > 0 } c ? c : "cmd.exe";
 
         if (File.Exists(unquoted))
@@ -58,13 +60,33 @@ public static class Launcher
                 _ => (cmd, $"/d /s /c \"\"{full}\"\"", dir),
             };
         }
+        string? entry = null;
+        string tail = "";
+        int end = trimmed.StartsWith('"') ? trimmed.IndexOf('"', 1) : trimmed.IndexOf(' ');
+        if (end > 0)
+        {
+            entry = trimmed.StartsWith('"') ? trimmed[1..end] : trimmed[..end];
+            tail = trimmed[(end + 1)..].TrimStart();
+            if (!Path.IsPathFullyQualified(entry) && cwd is not null) entry = Path.Combine(cwd, entry);
+        }
+        if (entry is not null && File.Exists(entry))
+        {
+            string full = Path.GetFullPath(entry);
+            string? dir = Path.GetDirectoryName(full);
+            return Path.GetExtension(full).ToLowerInvariant() switch
+            {
+                ".ps1" => ("powershell.exe", $"-NoLogo -NoProfile -ExecutionPolicy Bypass -File \"{full}\" {tail}", dir),
+                ".exe" => (full, tail, dir),
+                _ => (cmd, $"/d /s /c \"\"{full}\" {tail}\"", dir),
+            };
+        }
         return (cmd, $"/d /s /c \"{trimmed}\"", null);
     }
 
     /// <summary>Starts a command in its own console window (minimized/normal/hidden).</summary>
     public static LaunchedProcess? StartWithWindow(string command, string? cwd, string window)
     {
-        var (file, args, defaultCwd) = Build(command);
+        var (file, args, defaultCwd) = Build(command, cwd);
         var psi = new ProcessStartInfo(file, args)
         {
             UseShellExecute = true,
@@ -87,7 +109,7 @@ public static class Launcher
     /// </summary>
     public static LaunchedProcess StartWithLog(string command, string? cwd, string logFile, string header)
     {
-        var (file, args, defaultCwd) = Build(command);
+        var (file, args, defaultCwd) = Build(command, cwd);
         Directory.CreateDirectory(Path.GetDirectoryName(logFile)!);
         Rotate(logFile);
         File.AppendAllText(logFile, header);
@@ -126,7 +148,7 @@ public static class Launcher
     /// <summary>Runs a stop command and waits for it; returns its exit code (null if it didn't finish in time).</summary>
     public static async Task<int?> RunAndWaitAsync(string command, string? cwd, TimeSpan timeout)
     {
-        var (file, args, defaultCwd) = Build(command);
+        var (file, args, defaultCwd) = Build(command, cwd);
         using var p = Process.Start(new ProcessStartInfo(file, args)
         {
             UseShellExecute = true, WorkingDirectory = ResolveCwd(cwd, defaultCwd), WindowStyle = ProcessWindowStyle.Minimized,
